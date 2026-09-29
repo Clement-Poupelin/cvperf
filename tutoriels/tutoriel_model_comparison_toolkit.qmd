@@ -1,0 +1,652 @@
+---
+title: "Comparer des méthodes hétérogènes : Lasso, forêt aléatoire, MARS, SVM et XGBoost"
+author: "Clément Poupelin"
+date: 09-18-2026
+date-modified: "`r Sys.Date()`"
+format: 
+  html:
+    embed-resources: false
+    toc: true
+    code-fold: true
+    code-summary: "Show the code"
+    code-tools: true
+    toc-location: right
+    page-layout: article
+    code-overflow: wrap
+number-sections: false
+editor: visual
+categories: ["Model Comparison", "Lasso Regression", "Random Forest", "MARS", "SVM", "XGBoost"]
+description: "Guide pratique du toolkit `model_comparison_toolkit.R`"
+execute: 
+  echo: true 
+  warning: false 
+  message: false
+  error: true
+---
+
+```{=html}
+<!--
+=================================================================================
+tutoriel_model_comparison_toolkit.qmd
+=================================================================================
+Document AUTONOME, volet de comparaison de la série (après tutoriel_lasso_
+performance_toolkit.qmd et tutoriel_rf_performance_toolkit.qmd). Reprend les
+2 MÊMES jeux de données que ces tutoriels (lars::diabetes, gaussien ;
+AppliedPredictiveModeling::AlzheimerDisease, binomial) pour comparer
+directement un Lasso, une forêt aléatoire, un MARS, un SVM et un XGBoost
+(mars_/svm_/xgb_performance_toolkit.R) sur les mêmes folds.
+
+Ce document ne redéfinit pas les diagnostics déjà couverts par les 2 fichiers
+précédents (VIF, normalité, ROC individuelle, etc.) -- il se concentre
+uniquement sur ce qui n'existe QUE quand on compare plusieurs méthodes hétérogènes :
+performance appariée, classement des variables, recouvrement de sélection,
+courbes superposées, et valeurs de Shapley calculées avec le MÊME algorithme
+des 3 côtés (compare_shap()).
+
+PRÉREQUIS
+---------
+install.packages(c("ISLR2", "AppliedPredictiveModeling", "lars", "glmnet",
+                    "ranger", "earth", "rsample", "dplyr", "tidyr", "purrr", "tibble",
+                    "ggplot2", "patchwork", "car", "nortest", "ggrepel",
+                    "knitr", "viridis", "DT", "fastshap"))
+
+Les fichiers lasso_performance_toolkit_V3.R, rf_performance_toolkit.R,
+mars_performance_toolkit.R, svm_performance_toolkit.R, xgb_performance_toolkit.R, shap_toolkit.R et
+model_comparison_toolkit.R doivent se trouver dans le même
+dossier que ce document.
+=================================================================================
+-->
+```
+
+```{r setup}
+#| include: false
+
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(tibble)
+library(ggplot2)
+library(patchwork)
+library(glmnet)
+library(ranger)
+library(earth)
+library(rsample)
+library(car)
+library(nortest)
+library(ggrepel)
+library(viridis)
+library(knitr)
+library(DT)
+library(fastshap)
+
+library(cvperf)
+```
+
+```{r export-table-helper}
+#| include: false
+
+export_table <- function(df, caption = NULL, page_length = 10) {
+  DT::datatable(
+    df, caption = caption, rownames = FALSE, filter = "top",
+    extensions = "Buttons",
+    options = list(dom = "Bfrtip", buttons = c("csv", "excel"),
+                   pageLength = page_length, scrollX = TRUE)
+  )
+}
+```
+
+# Pourquoi ce tutoriel
+
+`compare_models_lasso()` et `compare_models_rf()` comparent des modèles de LA MÊME méthode entre eux (2 Lasso, ou 2 forêts). Ce document couvre le cas différent : comparer **cinq méthodes** -- Lasso, forêt aléatoire, MARS, SVM et XGBoost -- ou des modèles de formules différentes, **sur exactement les mêmes folds**, avec des fonctions qui s'appliquent à n'importe quel mélange de méthodes (2 à 5).
+
+::: {.callout-note title="📘 Pourquoi ces 5 méthodes : la matrice 2 × 2"}
+|  | **Parcimonieux / lisible** | **Boîte noire** |
+|------------------|--------------------------|--------------------------|
+| **Linéaire** | Lasso | *(SVM à noyau linéaire, non couvert par défaut)* |
+| **Non linéaire** | **MARS** (fonctions charnière, écarte les variables inutiles) | Forêt aléatoire (moyenne d'arbres), **XGBoost** (arbres correcteurs successifs), **SVM** à noyau gaussien (fonction lisse par similarité) |
+
+Les trois boîtes noires se distinguent par la **forme** de la fonction apprise : marches d'escalier moyennées (forêt), marches d'escalier corrigées séquentiellement (XGBoost), fonction lisse (SVM). Si elles concluent toutes à la même performance, le signal est robuste au choix de la méthode ; si l'une se détache, la forme de la relation compte.
+
+**Interprétation.** Aucune de ces méthodes n'a la même notion d'« importance » (coefficient, gain evimp, permutation) : `compare_importance()` compare donc des **rangs**, et `compare_shap()` recalcule des valeurs de Shapley par **le même algorithme pour toutes**, sur une échelle commune.
+:::
+
+::: {.callout-important title="⚠️ Le prérequis qui conditionne tout ce document"}
+Toute comparaison appariée (test de Wilcoxon/Friedman) suppose que "Fold n" désigne EXACTEMENT le même découpage train/test d'une méthode à l'autre. La règle est simple : construire l'objet `rsample::vfold_cv()` **une seule fois**, et le passer en argument `cv_repeats` à CHAQUE appel de `fit_lasso_repeated_cv()` / `fit_rf_repeated_cv()` / `fit_mars_repeated_cv()`.
+
+``` r
+set.seed(42)
+cv_repeats <- rsample::vfold_cv(data, v = 5, repeats = 20)
+fit_lasso  <- fit_lasso_repeated_cv(data, Y ~ . - 1, cv_repeats = cv_repeats)
+fit_rf     <- fit_rf_repeated_cv(data, Y ~ .,        cv_repeats = cv_repeats)
+fit_mars   <- fit_mars_repeated_cv(data, Y ~ .,      cv_repeats = cv_repeats)
+fit_svm    <- fit_svm_repeated_cv(data, Y ~ .,       cv_repeats = cv_repeats)
+fit_xgb    <- fit_xgb_repeated_cv(data, Y ~ .,       cv_repeats = cv_repeats)
+```
+
+`compare_methods()` et les autres fonctions de ce document vérifient ce prérequis (best-effort, via `.check_same_folds_generic()`) et avertissent -- sans arrêter l'exécution -- en cas de désaccord.
+:::
+
+## Vue d'ensemble des fonctions couvertes
+
+| Fonction | Rôle |
+|------------------------------------|------------------------------------|
+| `as_comparable_fit()` | Adaptateur générique : uniformise un `lasso_cv_fit`/`rf_cv_fit`/`mars_cv_fit`/`svm_cv_fit`/`xgb_cv_fit` (ou une future méthode) |
+| `compare_methods()` | Performance appariée entre N méthodes, tests + plot + leaderboard |
+| `leaderboard_table()` / `plot_metric_ranks()` | Synthèse et classement multi-métriques |
+| `compare_importance()` | Classement (rang) des variables entre méthodes |
+| `compare_shap()` | Comme `compare_importance()`, mais avec un score sur la MÊME échelle (SHAP) pour toutes les méthodes + recoupement avec la sélection Lasso |
+| `compare_variable_selection()` | Recouvrement des variables jugées importantes (Jaccard) |
+| `compare_roc()` / `compare_calibration()` | Courbes superposées (classification uniquement) |
+| `compare_computational_cost()` | Temps de calcul (folds + modèle final [+ SHAP]), parallélisation et coeurs utilisés par méthode |
+
+------------------------------------------------------------------------
+
+# Partie A : Régression -- progression du diabète
+
+```{r diab-load}
+library(lars)
+data(diabetes, package = "lars")
+
+diabetes_data <- as.data.frame(unclass(diabetes$x2))
+colnames(diabetes_data) <- make.names(colnames(diabetes_data), unique = TRUE)
+diabetes_data <- diabetes_data %>%
+  dplyr::mutate(y = diabetes$y, PatientID = as.character(dplyr::row_number()))
+
+labels_diabetes_base <- c(
+  age = "Âge", sex = "Sexe", bmi = "IMC", map = "Pression artérielle",
+  tc  = "Cholestérol total", ldl = "LDL", hdl = "HDL", tch = "Cholestérol/HDL",
+  ltg = "Triglycérides (log)", glu = "Glycémie"
+)
+labels_diabetes <- setNames(
+  vapply(colnames(diabetes_data), function(col) {
+    if (col %in% names(labels_diabetes_base)) return(labels_diabetes_base[[col]])
+    parts <- strsplit(col, "\\.")[[1]]
+    if (length(parts) == 2 && parts[2] == "2" && parts[1] %in% names(labels_diabetes_base)) {
+      return(paste0(labels_diabetes_base[[parts[1]]], "\u00b2"))
+    }
+    if (length(parts) == 2 && all(parts %in% names(labels_diabetes_base))) {
+      return(paste0(labels_diabetes_base[[parts[1]]], " \u00d7 ", labels_diabetes_base[[parts[2]]]))
+    }
+    col
+  }, character(1)),
+  colnames(diabetes_data)
+)
+```
+
+## Ajustement des 3 méthodes sur les mêmes folds
+
+```{r diab-fit}
+set.seed(42)
+cv_repeats_diab <- rsample::vfold_cv(diabetes_data, v = 5, repeats = 20)
+
+fit_lasso_diab <- fit_lasso_repeated_cv(
+  data = diabetes_data, formula = y ~ . - 1, id_col = "PatientID",
+  cv_repeats = cv_repeats_diab
+)
+
+fit_rf_diab <- fit_rf_repeated_cv(
+  data = diabetes_data, formula = y ~ ., id_col = "PatientID",
+  cv_repeats = cv_repeats_diab,
+  parallelisation = TRUE
+)
+
+fit_mars_diab <- fit_mars_repeated_cv(
+  data = diabetes_data, formula = y ~ ., id_col = "PatientID",
+  cv_repeats = cv_repeats_diab,
+  parallelisation = TRUE
+)
+
+fit_svm_diab <- fit_svm_repeated_cv(
+  data = diabetes_data, formula = y ~ ., id_col = "PatientID",
+  cv_repeats = cv_repeats_diab,
+  parallelisation = TRUE
+)
+
+fit_xgb_diab <- fit_xgb_repeated_cv(
+  data = diabetes_data, formula = y ~ ., id_col = "PatientID",
+  cv_repeats = cv_repeats_diab,
+  parallelisation = TRUE
+)
+```
+
+::: {.callout-tip title="📘 Ce que MARS a-t-il trouvé ? (avant de comparer)"}
+Avant de comparer la performance, `check_complexity_mars(fit_mars_diab)` répond à la question préalable *"MARS a-t-il réellement trouvé du non-linéaire ?"* : si presque aucun fold ne retient de fonction charnière ou d'interaction, MARS dégénère en régression linéaire creuse et sa comparaison au Lasso perd de son intérêt. Voir `tutoriel_mars_performance_toolkit.qmd` pour le détail.
+:::
+
+```{r diab-mars-complexity}
+check_complexity_mars(fit_mars_diab)
+```
+
+## Comparaison de performance : `compare_methods()`
+
+::: {.callout-note title="📘 Ce que fait compare_methods()"}
+Pour chaque métrique demandée : test global apparié (Wilcoxon si 2 méthodes, Friedman si 3+), comparaisons 2 à 2 corrigées (BH), et un plot "spaghetti" -- une ligne fine par fold, reliant sa valeur pour chaque méthode -- plus lisible qu'un boxplot pour des mesures appariées.
+:::
+
+```{r diab-compare-methods}
+#| fig-width: 10
+#| fig-height: 8
+
+comp_diab <- compare_methods(
+  fits = list(Lasso = fit_lasso_diab, "Forêt aléatoire" = fit_rf_diab, MARS = fit_mars_diab, SVM = fit_svm_diab, XGBoost = fit_xgb_diab)
+)
+comp_diab$plot
+```
+
+```{r diab-compare-pairwise}
+comp_diab$pairwise
+```
+
+::: {.callout-important title="⚠️ Les p-values sont INDICATIVES, pas inférentielles"}
+Les folds d'une CV répétée ne sont pas indépendants (leurs jeux d'entraînement se chevauchent fortement, et les répétitions réutilisent les mêmes observations) : les tests de Wilcoxon/Friedman ci-dessous sous-estiment la vraie variabilité et sont donc **anti-conservateurs** (Nadeau & Bengio, 2003). À utiliser pour ordonner les méthodes et repérer les écarts nets, pas pour affirmer une significativité au sens strict -- l'ampleur de `diff_mediane` reste le critère principal. Avec 3 méthodes, `compare_methods()` fait un test de Friedman global puis des comparaisons 2 à 2 corrigées (BH).
+:::
+
+::: {.callout-tip title="📘 Comment lire le plot et la table pairwise"}
+**Sur le plot** : chaque trait fin gris relie, pour UN fold, sa valeur pour chaque méthode -- l'équivalent d'une droite reliant 2 points appariés. Si la majorité des traits penchent dans le même sens (ex. presque tous descendent de Lasso vers RF sur le RMSE), c'est qu'une méthode domine systématiquement sur les folds, ce qu'un simple boxplot (qui ignore l'appariement) masquerait. Le point + trait orange = médiane et IQR (25e-75e percentile) à travers les 100 folds.
+
+**Sur la table `pairwise`** :
+
+- `diff_mediane` : médiane, **fold par fold**, de (valeur du modèle A − valeur du modèle B) -- son signe indique quelle méthode l'emporte typiquement, son amplitude donne une idée de la taille de l'écart dans l'unité de la métrique (ex. RMSE en unités de Y).
+- `p_value` / `p_adj` : p-value du test de Wilcoxon apparié, brute puis corrigée (Benjamini-Hochberg) pour le nombre de métriques testées simultanément -- toujours lire `p_adj`, pas `p_value`, dès qu'on compare plusieurs métriques à la fois.
+- `stars` : lecture rapide (`***`/`**`/`*`/`.`/`ns`) de `p_adj`.
+
+⚠️ Une différence "significative" (p_adj petit) n'est pas forcément une différence **importante en pratique** : avec 100 folds, même un écart de RMSE de 0.5 peut ressortir significatif. Toujours croiser `p_adj` avec `diff_mediane` (l'ampleur réelle) avant de conclure qu'une méthode est "meilleure".
+:::
+
+## Leaderboard et rangs
+
+::: {.callout-tip title="📘 Comment lire le leaderboard"}
+`leaderboard_table()` classe les méthodes par rang moyen à travers les métriques demandées (rang 1 = meilleure sur cette métrique ; les métriques d'erreur -- RMSE/MAE/MSE/Brier/Log-loss -- sont automatiquement inversées pour que "1" reste toujours "le mieux").
+
+Colonnes utiles à regarder : `<métrique>_mediane` (valeur typique, robuste aux folds atypiques), `<métrique>_sd` (dispersion entre folds -- une méthode avec une médiane légèrement meilleure mais un `sd` bien plus grand peut être moins fiable en pratique), et `rang_moyen` en toute fin (moyenne des rangs sur toutes les métriques demandées -- un résumé pratique, mais qui pondère chaque métrique de façon égale : si une métrique compte plus pour votre usage, regardez-la isolément plutôt que de vous fier uniquement à `rang_moyen`).
+:::
+
+```{r diab-leaderboard}
+export_table(comp_diab$leaderboard, caption = "Leaderboard -- diabète (5 méthodes)")
+```
+
+```{r diab-metric-ranks}
+#| fig-width: 6
+#| fig-height: 3
+
+plot_metric_ranks(comp_diab$leaderboard, metrics = c("rmse", "mse", "rsq", "mae"))
+```
+
+::: {.callout-note title="📘 Comment lire la heatmap des rangs"}
+Une ligne = une méthode, une colonne = une métrique, la valeur = son rang (1 = meilleure sur cette métrique, vert ; 2, 3... rouge). Utile surtout à partir de 3 méthodes ou métriques : permet de repérer d'un coup d'œil si une méthode domine sur TOUTES les métriques (toute sa ligne verte) ou seulement sur certaines (ligne mixte -- signe que le choix de méthode dépend de ce qu'on cherche à optimiser en priorité).
+:::
+
+## Classement des variables : `compare_importance()`
+
+::: {.callout-important title="📘 Rang, pas valeur brute"}
+Un coefficient Lasso (log-odds ou unité de Y) et une importance de permutation RF (réduction d'erreur) ne sont PAS sur la même échelle. `compare_importance()` compare donc le RANG de chaque variable au sein de sa propre méthode -- une lecture valide même quand les 2 échelles n'ont rien de comparable.
+:::
+
+```{r diab-compare-importance}
+#| fig-width: 10
+#| fig-height: 8
+
+comp_imp_diab <- compare_importance(
+  fits = list(Lasso = fit_lasso_diab, "Forêt aléatoire" = fit_rf_diab, MARS = fit_mars_diab, SVM = fit_svm_diab, XGBoost = fit_xgb_diab),
+  labels = NULL, top_n = 15
+)
+comp_imp_diab$plot
+comp_imp_diab$rank_correlation
+```
+
+Une corrélation de rang (`rho`), calculée pour chaque paire de méthodes, élevée signifierait que deux méthodes, pourtant construites très différemment, s'accordent largement sur quelles variables comptent -- un signal de robustesse. Une corrélation faible ou négative indiquerait au contraire qu'elles exploitent des structures différentes du signal (ex. la RF ou MARS captent des interactions/non-linéarités qu'une variable isolée, linéaire, ne peut pas représenter). **La paire la plus informative est souvent Lasso ↔ MARS** : les deux sont parcimonieux, donc un désaccord entre eux signale précisément des variables dont l'effet est non linéaire.
+
+::: {.callout-tip title="📘 Des repères pour interpréter rho (indicatifs, pas des seuils absolus)"}
+- **\|rho\| \> 0.7** : accord fort -- les méthodes pointent globalement vers les mêmes variables ; un bon signal que le classement n'est pas un artefact de la méthode choisie.
+- **0.3 \< \|rho\| \< 0.7** : accord modéré -- un socle commun de variables importantes, mais des divergences notables à investiguer (souvent les variables impliquées dans des interactions/non-linéarités, mieux captées par la RF).
+- **\|rho\| \< 0.3** : accord faible -- les méthodes racontent des histoires assez différentes ; c'est en soi une information (le signal n'est peut-être pas bien capturé par une relation linéaire additive), pas une erreur d'une des méthodes.
+
+`rank_correlation` inclut aussi `n_variables_communes` : un `rho` calculé sur très peu de variables communes (ex. 2 formules très différentes) est peu fiable -- toujours vérifier cette colonne avant d'interpréter `rho`.
+:::
+
+## Recouvrement des variables retenues : `compare_variable_selection()`
+
+::: {.callout-tip title="📘 Comment lire l'indice de Jaccard et le plot"}
+L'indice de **Jaccard** = taille de l'intersection / taille de l'union des 2 ensembles de variables retenues -- **0** = aucune variable en commun, **1** = ensembles identiques. Contrairement à `compare_importance()` (rang de TOUTES les variables), ici chaque méthode a d'abord dû trancher un ensemble binaire "importante / pas importante" -- via `min_pct_folds` pour le Lasso (coefficient ≠ 0 dans au moins ce % de folds) et `top_k_rf` pour la RF (dans le top-K par importance dans au moins ce % de folds). **Ce résultat est donc sensible à ces seuils** (MARS suit la même règle que le Lasso : variable présente dans au moins un terme retenu, dans au moins `min_pct_folds`% des folds) : les faire varier (ex. `top_k_rf = 10` vs `20`) avant de conclure à un faible recouvrement, pour vérifier que ce n'est pas un artefact du seuillage plutôt qu'un vrai désaccord entre méthodes.
+
+Sur le plot, les barres à droite (nombre de méthodes élevé) sont les variables consensuelles ; les variables retenues par une seule méthode apparaissent dans `comp_sel_diab$table` (colonnes `Lasso`/`Forêt aléatoire`/`MARS` en `TRUE`/`FALSE`) mais pas forcément dans le graphique si `top_n` du bump chart voisin les exclut.
+:::
+
+```{r diab-compare-selection}
+#| fig-width: 8
+#| fig-height: 6
+
+comp_sel_diab <- compare_variable_selection(
+  fits = list(Lasso = fit_lasso_diab, "Forêt aléatoire" = fit_rf_diab, MARS = fit_mars_diab, SVM = fit_svm_diab, XGBoost = fit_xgb_diab),
+  min_pct_folds = 50, top_k_rf = 15
+)
+comp_sel_diab$plot
+comp_sel_diab$jaccard
+```
+
+```{r diab-compare-selection-table}
+export_table(comp_sel_diab$table, caption = "Variables jugées importantes, par méthode (diabète)")
+```
+
+## Comparaison SHAP : `compare_shap()`
+
+::: {.callout-important title="📘 Ce que compare_shap() apporte de plus que compare_importance()"}
+`compare_importance()` compare un **rang** parce que le coefficient Lasso et l'importance de permutation RF sont sur 2 échelles totalement différentes (log-odds/unité de Y vs réduction d'erreur) -- comparer leur VALEUR n'aurait aucun sens. `compare_shap()` calcule à la place les valeurs de Shapley de tous les modèles avec le **même algorithme model-agnostic** (`check_shap()`, approximation Monte Carlo de Štrumbelj & Kononenko), ce qui les met sur la **même échelle** (contribution à la prédiction, dans l'unité de la réponse) -- une comparaison en MAGNITUDE devient possible, pas seulement en rang.
+
+Second avantage, spécifique à cette comparaison Lasso/RF : quand un `lasso_cv_fit` fait partie des modèles comparés, la table renvoyée par `compare_shap()` inclut une colonne `Lasso_selectionnee` (`TRUE` si le coefficient de cette variable est non-nul dans au moins 50 % des folds du Lasso) -- ce qui permet de répondre directement à *"les variables les plus importantes selon la RF sont-elles celles que le Lasso a sélectionnées ?"*, visible dans le bump chart ci-dessous via la forme des points (triangle = sélectionnée par le Lasso).
+
+⚠️ Plus lent que les autres fonctions de comparaison : `compare_shap()` réajuste un calcul de valeurs de Shapley complet par modèle (cf. note de coût dans `shap_toolkit.R`). Sur ce jeu de données (p = 64, n = 442), `nsim = 50` reste de l'ordre de quelques dizaines de secondes par modèle ; augmenter `nsim` (plus précis) ou réduire `sample_size` (plus rapide) selon le besoin. **Levier à essayer en premier, sans aucune perte de précision** : `parallelisation = TRUE` répartit ce calcul sur plusieurs coeurs (par modèle si assez de coeurs sont disponibles, sinon par observation à l'intérieur de chaque modèle -- cf. `shap_toolkit.R`) ; contrairement à `nsim`/`sample_size`, cela ne change strictement rien au résultat, seulement au temps.
+:::
+
+```{r diab-compare-shap}
+#| fig-width: 10
+#| fig-height: 8
+
+comp_shap_diab <- compare_shap(
+  fits = list(Lasso = fit_lasso_diab, "Forêt aléatoire" = fit_rf_diab, MARS = fit_mars_diab, SVM = fit_svm_diab, XGBoost = fit_xgb_diab),
+  nsim = 50, top_n = 15, parallelisation = TRUE
+)
+comp_shap_diab$plot
+comp_shap_diab$time_sec   # temps total de ce calcul SHAP (5 modeles)
+```
+
+::: {.callout-tip title="📘 Comment lire le bump chart SHAP"}
+Chaque ligne colorée = une variable, sa position verticale à chaque colonne = son rang SHAP **dans ce modèle** (1 = la plus importante, en haut). Une ligne quasi horizontale = la variable est classée de façon similaire par les méthodes ; une ligne qui descend ou remonte fortement = son importance diffère nettement d'une méthode à l'autre.
+
+La **forme** des points distingue 3 cas (uniquement quand un Lasso fait partie de la comparaison) :
+
+- **Triangle plein** : la variable est sélectionnée par le Lasso (coefficient ≠ 0 dans ≥ 50 % des folds).
+- **Rond** : présente dans la formule du Lasso mais jamais (ou rarement) sélectionnée -- coefficient ramené à 0 par la pénalisation.
+- **Croix** : la variable n'apparaît pas du tout dans les prédicteurs testés par le Lasso (`NA` dans `Lasso_pct_folds_selectionnee`).
+
+Une variable très importante en SHAP pour la RF ou MARS (haut du classement) mais représentée par un **rond** ou une **croix** est le cas le plus intéressant à investiguer : le Lasso l'a écartée (ou ne la testait pas), alors qu'elle contribue visiblement à la prédiction dans un cadre non-linéaire -- signe probable d'un effet non-linéaire ou d'une interaction qu'un terme linéaire isolé ne peut pas représenter.
+:::
+
+```{r diab-compare-shap-table}
+export_table(
+  comp_shap_diab$table,
+  caption = "Importance SHAP par méthode -- diabète (avec sélection Lasso en regard)"
+)
+comp_shap_diab$rank_correlation
+```
+
+------------------------------------------------------------------------
+
+# Partie B : Classification -- diagnostic de la maladie d'Alzheimer
+
+```{r alz-load}
+library(AppliedPredictiveModeling)
+data(AlzheimerDisease)
+
+alzheimer_data <- predictors %>%
+  dplyr::mutate(diagnosis = diagnosis, PatientID = as.character(dplyr::row_number()))
+```
+
+::: {.callout-note title="ℹ️ Labels des biomarqueurs"}
+`labels_alzheimer` (dictionnaire complet en français) est déjà défini dans `tutoriel_lasso_performance_toolkit.qmd` -- réutilisable en le sourçant si besoin. Les exemples ci-dessous utilisent les noms de colonnes bruts.
+:::
+
+## Ajustement des 3 méthodes sur les mêmes folds
+
+```{r alz-fit}
+set.seed(42)
+cv_repeats_alz <- rsample::vfold_cv(alzheimer_data, v = 5, repeats = 20)
+
+fit_lasso_alz <- fit_lasso_repeated_cv(
+  data = alzheimer_data, formula = diagnosis ~ . - 1, id_col = "PatientID",
+  family = "binomial", cv_repeats = cv_repeats_alz
+)
+
+fit_rf_alz <- fit_rf_repeated_cv(
+  data = alzheimer_data, formula = diagnosis ~ ., id_col = "PatientID",
+  family = "binomial", cv_repeats = cv_repeats_alz
+)
+
+fit_mars_alz <- fit_mars_repeated_cv(
+  data = alzheimer_data, formula = diagnosis ~ ., id_col = "PatientID",
+  family = "binomial", cv_repeats = cv_repeats_alz,
+  parallelisation = TRUE
+)
+
+fit_svm_alz <- fit_svm_repeated_cv(
+  data = alzheimer_data, formula = diagnosis ~ ., id_col = "PatientID",
+  family = "binomial", cv_repeats = cv_repeats_alz,
+  parallelisation = TRUE
+)
+
+fit_xgb_alz <- fit_xgb_repeated_cv(
+  data = alzheimer_data, formula = diagnosis ~ ., id_col = "PatientID",
+  family = "binomial", cv_repeats = cv_repeats_alz,
+  parallelisation = TRUE
+)
+```
+
+```{r alz-mars-complexity}
+check_complexity_mars(fit_mars_alz)
+```
+
+## Comparaison de performance
+
+```{r alz-compare-methods}
+#| fig-width: 10
+#| fig-height: 8
+
+comp_alz <- compare_methods(
+  fits    = list(Lasso = fit_lasso_alz, "Forêt aléatoire" = fit_rf_alz, MARS = fit_mars_alz, SVM = fit_svm_alz, XGBoost = fit_xgb_alz),
+  metrics = c("accuracy", "auc", "brier", "logloss")
+)
+comp_alz$plot
+comp_alz$pairwise
+```
+
+::: {.callout-tip title="📘 Quelle métrique regarder en premier, en classification"}
+Avec 4 métriques affichées, ne pas les traiter comme équivalentes :
+
+- **AUC** : mesure la capacité à ORDONNER les patients par risque, indépendamment d'un seuil de décision -- la métrique la plus robuste pour juger la *discrimination* du modèle.
+- **Brier** (= MSE sur les probabilités) et **Log-loss** : pénalisent aussi la **calibration** (une probabilité prédite de 0.9 doit correspondre à ~90 % d'événements observés), pas seulement l'ordre -- 2 modèles avec la même AUC peuvent avoir un Brier très différent si l'un est mal calibré (cf. `compare_calibration()` plus bas).
+- **Accuracy** : dépend du seuil de décision choisi (`classification_threshold`, 0.5 par défaut) -- la métrique la plus fragile des 4 en cas de classes déséquilibrées.
+
+Si `comp_alz$pairwise` montre un AUC proche entre les méthodes mais un Brier/Log-loss nettement différent, le désaccord porte sur la CALIBRATION plutôt que sur la discrimination -- allez directement comparer `compare_calibration()`.
+:::
+
+```{r alz-leaderboard}
+export_table(comp_alz$leaderboard, caption = "Leaderboard -- Alzheimer (5 méthodes)")
+```
+
+## Courbes superposées : `compare_roc()` et `compare_calibration()`
+
+::: {.callout-tip title="📘 Pourquoi superposer plutôt que juxtaposer"}
+Les fonctions `plot_roc_*()`/`plot_calibration_*()` de chaque toolkit individuel tracent UNE courbe. Ici, `compare_roc()`/`compare_calibration()` superposent les courbes de toutes les méthodes fournies sur le MÊME graphique -- la comparaison visuelle directe (croisement des courbes ROC, écarts de calibration à une même probabilité prédite) est souvent plus parlante que la seule AUC.
+:::
+
+```{r alz-compare-roc}
+#| fig-width: 7
+#| fig-height: 6
+
+compare_roc(list(Lasso = fit_lasso_alz, "Forêt aléatoire" = fit_rf_alz, MARS = fit_mars_alz, SVM = fit_svm_alz, XGBoost = fit_xgb_alz))
+```
+
+::: {.callout-note title="📘 Comment lire des courbes ROC superposées"}
+Une courbe ROC toujours **au-dessus** de l'autre, sur toute sa longueur, indique une méthode qui domine à TOUT seuil de décision -- l'AUC (donnée dans la légende) résume alors bien la comparaison. Des courbes qui se **croisent** signalent au contraire qu'aucune méthode ne domine partout : l'une est meilleure à seuil strict (peu de faux positifs tolérés), l'autre à seuil permissif -- dans ce cas, l'AUC seule masque une information utile ; il faut choisir la méthode en fonction du seuil de décision réellement visé en pratique (ex. dépistage à haute sensibilité vs confirmation diagnostique à haute spécificité).
+:::
+
+```{r alz-compare-calibration}
+#| fig-width: 7
+#| fig-height: 6
+
+compare_calibration(list(Lasso = fit_lasso_alz, "Forêt aléatoire" = fit_rf_alz, MARS = fit_mars_alz, SVM = fit_svm_alz, XGBoost = fit_xgb_alz))
+```
+
+::: {.callout-note title="📘 Comment lire des courbes de calibration superposées"}
+La diagonale pointillée = calibration parfaite (probabilité prédite = fréquence réellement observée). Une courbe **au-dessus** de la diagonale sous-estime le risque (le modèle prédit moins d'événements qu'il n'en survient réellement dans ce bin) ; **en dessous**, il le surestime.
+
+Point de vigilance déjà signalé dans `tutoriel_rf_performance_toolkit.qmd` : une forêt de probabilité tend à "tasser" ses prédictions vers 0.5 (peu de probabilités extrêmes, même quand le signal est fort), ce qui se traduit typiquement par une courbe RF en **S** autour de la diagonale (sous-estime le risque des patients à haut risque, le sur-estime pour les patients à bas risque) -- un patron différent d'un éventuel écart de calibration du Lasso, qui optimise directement la déviance binomiale (log-loss) et est donc structurellement mieux calibré par construction, sauf en cas de sur-régularisation forte. MARS, lui, ajuste un GLM binomial sur ses termes charnière (`family = "binomial"`) : sa calibration se rapproche typiquement de celle du Lasso, avec un risque de sur-confiance (probabilités trop extrêmes) si `degree = 2` sur un petit échantillon.
+:::
+
+## Classement des biomarqueurs et recouvrement de sélection
+
+```{r alz-compare-importance}
+#| fig-width: 10
+#| fig-height: 8
+
+comp_imp_alz <- compare_importance(
+  fits = list(Lasso = fit_lasso_alz, "Forêt aléatoire" = fit_rf_alz, MARS = fit_mars_alz, SVM = fit_svm_alz, XGBoost = fit_xgb_alz), top_n = 15
+)
+comp_imp_alz$plot
+comp_imp_alz$rank_correlation
+```
+
+```{r alz-compare-selection}
+#| fig-width: 8
+#| fig-height: 6
+
+comp_sel_alz <- compare_variable_selection(
+  fits = list(Lasso = fit_lasso_alz, "Forêt aléatoire" = fit_rf_alz, MARS = fit_mars_alz, SVM = fit_svm_alz, XGBoost = fit_xgb_alz)
+)
+comp_sel_alz$plot
+comp_sel_alz$jaccard
+```
+
+::: {.callout-tip title="📘 Sur un grand panel (p ≈ 130), maîtriser le coût de compare_shap()"}
+Avec p ≈ 130 biomarqueurs, `compare_shap()` par défaut (`nsim = 50`, toutes les observations) peut prendre plusieurs minutes côté RF, SVM et XGBoost (et, dans une moindre mesure, MARS) -- le coût croît avec le nombre de méthodes. Deux leviers se combinent : `sample_size` réduit le nombre d'observations expliquées sans changer la précision de chaque valeur de Shapley individuelle (bon réglage pour explorer rapidement avant un calcul complet) ; `parallelisation = TRUE` répartit le calcul sur plusieurs coeurs **sans aucune perte de précision** (à essayer en premier, cf. section précédente).
+:::
+
+```{r alz-compare-shap}
+#| fig-width: 10
+#| fig-height: 8
+
+comp_shap_alz <- compare_shap(
+  fits        = list(Lasso = fit_lasso_alz, "Forêt aléatoire" = fit_rf_alz, MARS = fit_mars_alz, SVM = fit_svm_alz, XGBoost = fit_xgb_alz),
+  nsim        = 30,
+  sample_size = 150,
+  top_n       = 15,
+  parallelisation = TRUE
+)
+comp_shap_alz$plot
+comp_shap_alz$rank_correlation
+comp_shap_alz$time_sec
+```
+
+```{r alz-compare-shap-table}
+export_table(
+  comp_shap_alz$table,
+  caption = "Importance SHAP par méthode -- Alzheimer (avec sélection Lasso en regard)"
+)
+```
+
+## Temps de calcul : `compare_computational_cost()`
+
+::: {.callout-note title="📘 Ce que ça mesure"}
+Chaque `fit_*_repeated_cv()` récent enregistre, dans `fit$computational_info`, le temps passé dans la boucle de CV répétée, le temps du modèle final, si le calcul a été parallélisé et sur combien de coeurs. `compare_computational_cost()` met tout ça côte à côte -- utile pour décider, AVANT de lancer une analyse complète (`repeats = 20` sur un grand panel), si une méthode coûteuse (SVM, XGBoost) reste raisonnable, ou pour documenter le coût de calcul dans un rapport (recommandé par TRIPOD+AI). En lui passant le résultat d'un `compare_shap()`, le temps SHAP s'ajoute à la comparaison.
+:::
+
+```{r alz-compare-cost}
+#| fig-width: 8
+#| fig-height: 5
+
+comp_cout_alz <- compare_computational_cost(
+  fits        = list(Lasso = fit_lasso_alz, "Forêt aléatoire" = fit_rf_alz, MARS = fit_mars_alz, SVM = fit_svm_alz, XGBoost = fit_xgb_alz),
+  shap_result = comp_shap_alz
+)
+comp_cout_alz$table
+comp_cout_alz$plot
+```
+
+Le Lasso est presque toujours la méthode la plus rapide (pas de réglage d'hyperparamètre coûteux) ; SVM et XGBoost, qui réglent chacun 2 à 3 hyperparamètres par CV interne, sont typiquement les plus lentes -- l'écart se creuse encore avec le SHAP, dont le coût dépend de la complexité de `predict()` pour chaque méthode. `parallelisation = TRUE` (déjà utilisé dans `fit_svm_diab`/`fit_xgb_diab` plus haut) réduit `temps_folds_sec`, pas `temps_shap_sec` -- pour ce dernier, c'est `compare_shap(..., parallelisation = TRUE)` qui agit (section précédente).
+
+------------------------------------------------------------------------
+
+# Cas d'usage central : les biomarqueurs ajoutent-ils de la prédiction ?
+
+Tout ce qui précède compare des **méthodes**. Mais `compare_methods()` compare tout aussi bien **deux formules** d'une même méthode ajustées sur les mêmes folds -- ce qui répond directement à la question « ce groupe de biomarqueurs apporte-t-il quelque chose *en plus* de ce qu'on sait déjà ? ». Exemple avec le diabète : variables cliniques de base (`age`, `sex`, `bmi`, `map`) contre cliniques + bilan sanguin (`tc`, `ldl`, `hdl`, `tch`, `ltg`, `glu`).
+
+```{r diab-added-value}
+#| fig-width: 9
+#| fig-height: 6
+
+f_clin <- y ~ age + sex + bmi + map
+f_bio  <- y ~ age + sex + bmi + map + tc + ldl + hdl + tch + ltg + glu
+
+fit_xgb_clin <- fit_xgb_repeated_cv(diabetes_data, f_clin, id_col = "PatientID",
+                                     cv_repeats = cv_repeats_diab, parallelisation = TRUE)
+fit_xgb_bio  <- fit_xgb_repeated_cv(diabetes_data, f_bio,  id_col = "PatientID",
+                                     cv_repeats = cv_repeats_diab, parallelisation = TRUE)
+
+comp_ajout <- compare_methods(
+  list("Cliniques seules" = fit_xgb_clin, "Cliniques + bilan sanguin" = fit_xgb_bio)
+)
+comp_ajout$plot
+comp_ajout$pairwise
+```
+
+::: {.callout-important title="⚠️ Lire l'ampleur avant les étoiles"}
+La colonne `diff_mediane` donne le **gain de performance** (en RMSE, R², AUC...) apporté par les biomarqueurs ; c'est elle qui compte. Les p-values sont **anti-conservatrices** (folds non indépendants, cf. Nadeau & Bengio, 2003) : une différence minime « significative » n'est pas un résultat. Et si les biomarqueurs ont été **sélectionnés sur les mêmes patients** que ceux du jeu de validation croisée (par exemple par une analyse différentielle préalable), la performance avec biomarqueurs est **optimiste** : cf. Ambroise & McLachlan (2002) et `projet_pd_prediction_template.qmd`.
+:::
+
+# Étendre à une méthode supplémentaire
+
+::: {.callout-note title="📘 Architecture extensible : ajouter une méthode au package {cvperf}"}
+Toutes les méthodes produisent un objet de classe `c("<methode>_cv_fit", "cv_fit")` aux champs communs garantis (`fold_predictions`, `fold_importance`, `cv_repeats`...). Toutes les fonctions de comparaison -- **y compris `compare_shap()`** -- fonctionnent donc sans modification pour une nouvelle méthode. Pour ajouter, par exemple, LightGBM, il suffit d'écrire un fichier `R/method_lightgbm.R` contenant :
+
+``` r
+fit_lightgbm_repeated_cv <- function(data, formula, id_col = "NUM_PAT", v = 5, repeats = 20,
+                                     family = c("gaussian", "binomial"), classification_threshold = 0.5,
+                                     seed = 42, cv_repeats = NULL, parallelisation = FALSE, n_cores = NULL) {
+  family <- match.arg(family)
+  fold_fun <- function(train, test, fold_num) {
+    tr <- .prepare_matrix_data(train, formula, id_col, family, allow_na_x = TRUE)
+    te <- .prepare_matrix_data(test,  formula, id_col, family, allow_na_x = TRUE)
+    if (is.null(tr) || is.null(te)) return(NULL)
+    model <- <ajustement sur tr$X, tr$Y>
+    list(Y = te$Y, pred = <prédiction sur te$X>,
+         extras = list(importance  = tibble::tibble(Variable = ..., Importance = ...),
+                       hyperparams = tibble::tibble(...)))
+  }
+  cv  <- run_repeated_cv(data, formula, id_col, family, v, repeats, seed, cv_repeats,
+                         fold_fun, parallelisation, n_cores)
+  fin <- .time_it(<ajustement du modèle final>)
+  new_cv_fit(cv, data, formula, id_col, family, classification_threshold, v, repeats,
+             fold_importance = cv$extras$importance, fold_hyperparams = cv$extras$hyperparams,
+             final_model = fin$value, final_time_sec = fin$time_sec,
+             method = "lightgbm", method_label = "LightGBM", importance_type = "gain",
+             class = "lightgbm_cv_fit")
+}
+
+# Seul crochet OBLIGATOIRE : le design du modèle final (plots "final", effets, SHAP)
+model_design.lightgbm_cv_fit <- function(fit, ...) {
+  p <- .prepare_matrix_data(fit$data, fit$formula, fit$id_col, fit$family, allow_na_x = TRUE)
+  list(X = p$X, Y = p$Y, var_map = stats::setNames(colnames(p$X), colnames(p$X)),
+       predict = function(newdata) <prédiction de fit$final_model sur newdata>)
+}
+```
+
+`compare_variable_selection()` choisit automatiquement sa règle : une méthode **creuse** (qui écarte des variables) signale ce comportement par une colonne logique `Used` dans `fold_importance` (comme le Lasso et MARS) ; sinon la méthode est traitée comme **dense** (règle du top-K). Les crochets optionnels (`method_notes()`, `check_hyperparam_stability()`, `plot_hyperparam_path()`, `importance_table()`...) enrichissent les sorties sans être nécessaires.
+:::
+
+# Récapitulatif : quelle fonction pour quel besoin ?
+
+| Besoin | Fonction |
+|------------------------------------|------------------------------------|
+| Uniformiser un fit pour le rendre comparable | `as_comparable_fit()` |
+| Comparer la performance de N méthodes hétérogènes sur les mêmes folds | `compare_methods()` |
+| Résumer et classer les méthodes | `leaderboard_table()`, `plot_metric_ranks()` |
+| Comparer le classement des variables entre méthodes | `compare_importance()` |
+| Comparer l'importance des variables sur la MÊME échelle + sélection Lasso | `compare_shap()` |
+| Vérifier que MARS a réellement trouvé du non-linéaire | `check_complexity_mars()` (toolkit MARS) |
+| Mesurer ce qu'un GROUPE de biomarqueurs apporte à la prédiction | `group_importance_svm()` / `group_importance_xgb()` (permutation d'un bloc), ou 2 formules dans `compare_methods()` |
+| Comparer l'ensemble des variables retenues | `compare_variable_selection()` |
+| Superposer des courbes ROC / calibration | `compare_roc()`, `compare_calibration()` |
+| Comparer le temps de calcul (+ parallélisation, coeurs) entre méthodes | `compare_computational_cost()` |
+| Accélérer `compare_shap()` sans perte de précision | `parallelisation = TRUE` (par modèle ou par observation selon le nb de coeurs) |
+
+# Références complètes
+
+-   Voir `tutoriel_lasso_performance_toolkit.qmd` (théorie du Lasso, origine des 2 jeux de données) et `tutoriel_rf_performance_toolkit.qmd` (théorie de la forêt aléatoire) pour les références déjà citées.
+-   Friedman, J. H. (1991). *Multivariate Adaptive Regression Splines.* The Annals of Statistics, 19(1), 1–67. — Algorithme MARS (passe avant / passe arrière, fonctions charnière) implémenté par le package {earth} (Milborrow).
+-   Ambroise, C., & McLachlan, G. J. (2002). *Selection bias in gene extraction on the basis of microarray gene-expression data.* PNAS, 99(10), 6562–6566. — Montre que sélectionner les variables sur l'ensemble des données AVANT la validation croisée rend la performance estimée trop optimiste.
+-   Voir `tutoriel_svm_performance_toolkit.qmd` et `tutoriel_xgb_performance_toolkit.qmd` pour la théorie du SVM et du gradient boosting.
+-   Nadeau, C., & Bengio, Y. (2003). *Inference for the Generalization Error.* Machine Learning, 52, 239–281. — Explique pourquoi les tests appariés sur des folds de validation croisée sont anti-conservateurs (folds non indépendants) : les p-values de `compare_methods()` sont à lire comme indicatives.
+-   Demšar, J. (2006). *Statistical Comparisons of Classifiers over Multiple Data Sets.* Journal of Machine Learning Research, 7, 1–30. — Référence classique sur les tests appariés (Wilcoxon/Friedman + comparaisons post-hoc) utilisés ici pour comparer des méthodes de machine learning sur des folds partagés.
+-   Kuncheva, L. I. (2004). *Combining Pattern Classifiers: Methods and Algorithms.* Wiley. — Chapitre sur la comparaison de classifieurs, dont l'usage de l'indice de Jaccard pour le recouvrement d'ensembles de variables/caractéristiques sélectionnées.
+-   Štrumbelj, E., & Kononenko, I. (2014). *Explaining prediction models and individual predictions with feature contributions.* Knowledge and Information Systems, 41(3), 647–665. — Algorithme Monte Carlo model-agnostic utilisé par `compare_shap()` (via `check_shap()`/{fastshap}) pour calculer des valeurs de Shapley comparables entre Lasso, RF et MARS.
+-   Lundberg, S. M., & Lee, S.-I. (2017). *A Unified Approach to Interpreting Model Predictions.* NeurIPS. — Cadre SHAP général dont s'inspire l'interprétation des valeurs de Shapley (magnitude et signe de la contribution de chaque variable à chaque prédiction).

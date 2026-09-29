@@ -1,0 +1,726 @@
+---
+title: "Performance et interprétation de XGBoost en validation croisée répétée"
+author: "Clément Poupelin"
+date: 09-21-2026
+date-modified: "`r Sys.Date()`"
+format: 
+  html:
+    embed-resources: false
+    toc: true
+    code-fold: true
+    code-summary: "Show the code"
+    code-tools: true
+    toc-location: right
+    page-layout: article
+    code-overflow: wrap
+number-sections: false
+editor: visual
+categories: [XGBoost, Gradient boosting, Machine Learning, Toolkit, Validation croisée, SHAP]
+description: "Tutoriel du toolkit xgb_performance_toolkit.R : gradient boosting, réglage (profondeur, eta, nombre d'arbres) imbriqué, importance par permutation et gain natif, importance de groupe, effets partiels et SHAP."
+execute: 
+  echo: true 
+  warning: false 
+  message: false
+  error: true
+---
+
+<!--
+=================================================================================
+tutoriel_xgb_performance_toolkit.qmd
+=================================================================================
+Document AUTONOME, 5e volet "modèle" de la série (après Lasso, forêt, MARS et
+SVM). Mêmes 2 exemples que les tutoriels précédents (même jeu de données,
+id_col, seed/v/repeats) pour rester directement comparables :
+
+  A. Gaussienne,  p < n (p=64,  n=442) -- lars::diabetes
+  B. Binomiale,   p < n (p≈130, n=333) -- AppliedPredictiveModeling::AlzheimerDisease
+
+PRÉREQUIS
+---------
+install.packages(c("ISLR2", "AppliedPredictiveModeling", "lars", "xgboost",
+                    "rsample", "dplyr", "tidyr", "purrr", "tibble",
+                    "ggplot2", "patchwork", "ggrepel", "nortest",
+                    "fastshap", "knitr", "viridis", "DT"))
+
+xgb_performance_toolkit.R et shap_toolkit.R doivent se trouver dans le même
+dossier que ce document. Les schémas de la section « Fondations » sont
+générés en R (ggplot2/xgboost), directement dans ce document -- aucun
+fichier image externe à télécharger.
+
+AVERTISSEMENT : comme les toolkits, ce document n'a pas pu être exécuté dans
+l'environnement de rédaction (pas de runtime R) : un aller-retour de débogage
+au premier render est possible, notamment selon la version de {xgboost}.
+=================================================================================
+-->
+
+```{r setup}
+#| include: false
+
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(tibble)
+library(ggplot2)
+library(patchwork)
+library(xgboost)
+library(rsample)
+library(ggrepel)
+library(nortest)
+library(viridis)
+library(knitr)
+library(DT)
+
+library(cvperf)
+```
+
+```{r export-table-helper}
+#| include: false
+
+export_table <- function(df, caption = NULL, page_length = 10) {
+  DT::datatable(
+    df, caption = caption, rownames = FALSE, filter = "top",
+    extensions = "Buttons",
+    options = list(dom = "Bfrtip", buttons = c("csv", "excel"),
+                   pageLength = page_length, scrollX = TRUE)
+  )
+}
+```
+
+# Fondations : comprendre XGBoost de zéro
+
+```{r diagram-helpers}
+#| include: false
+
+# Petits schémas "boîtes + flèches" en ggplot2 pur (aucune dépendance
+# supplémentaire) -- remplace les anciens schémas SVG externes : tout est
+# recalculé ici, à chaque rendu, sans fichier à télécharger séparément.
+
+chain_diagram <- function(labels, fills = "#EEF3F8", title = NULL, subtitle = NULL,
+                           box_w = 2.8, box_h = 1.3, size = 3.1) {
+  n <- length(labels)
+  fills <- rep_len(fills, n)
+  boxes <- tibble::tibble(x = seq(0, by = box_w + 0.5, length.out = n), y = 0, label = labels, fill = fills)
+  arrows <- tibble::tibble(x = boxes$x[-n] + box_w, xend = boxes$x[-1], y = box_h / 2, yend = box_h / 2)
+  ggplot2::ggplot() +
+    ggplot2::geom_rect(data = boxes, ggplot2::aes(xmin = x, xmax = x + box_w, ymin = y, ymax = y + box_h, fill = fill),
+                        color = "grey30") +
+    ggplot2::geom_text(data = boxes, ggplot2::aes(x = x + box_w / 2, y = y + box_h / 2, label = label),
+                        size = size, lineheight = 0.9) +
+    ggplot2::geom_segment(data = arrows, ggplot2::aes(x = x, y = y, xend = xend, yend = yend),
+                           arrow = ggplot2::arrow(length = grid::unit(0.18, "cm")), linewidth = 0.6) +
+    ggplot2::scale_fill_identity() +
+    ggplot2::coord_equal(clip = "off") +
+    ggplot2::theme_void() +
+    ggplot2::labs(title = title, subtitle = subtitle) +
+    ggplot2::theme(plot.subtitle = ggplot2::element_text(colour = "grey45", size = 9),
+                   plot.title    = ggplot2::element_text(face = "bold"))
+}
+
+# Diagramme "en éventail" : plusieurs boîtes du haut convergent vers UNE
+# boîte du bas (bagging), ou s'enchaînent en plus en haut (boosting).
+flow_diagram <- function(step_labels, agg_label, title = NULL, sequential = FALSE,
+                          box_w = 1.5, box_h = 0.9, top_fill = "#E8F5E9", agg_fill = "#EEF3F8") {
+  n  <- length(step_labels)
+  xs <- seq(0, by = box_w + 0.35, length.out = n)
+  boxes <- tibble::tibble(x = xs, y = 2, label = step_labels)
+  agg_x <- mean(xs)
+  agg   <- tibble::tibble(x = agg_x, y = 0, label = agg_label)
+
+  p <- ggplot2::ggplot() +
+    ggplot2::geom_rect(data = boxes, ggplot2::aes(xmin = x, xmax = x + box_w, ymin = y - box_h / 2, ymax = y + box_h / 2),
+                        fill = top_fill, color = "grey30") +
+    ggplot2::geom_text(data = boxes, ggplot2::aes(x = x + box_w / 2, y = y, label = label), size = 2.7, lineheight = 0.85) +
+    ggplot2::geom_rect(data = agg, ggplot2::aes(xmin = x - 0.1, xmax = x + box_w + 0.1, ymin = y - box_h / 2, ymax = y + box_h / 2),
+                        fill = agg_fill, color = "grey30") +
+    ggplot2::geom_text(data = agg, ggplot2::aes(x = x + box_w / 2, y = y, label = label), size = 2.9, lineheight = 0.85)
+
+  for (i in seq_len(n)) {
+    p <- p + ggplot2::geom_segment(
+      x = xs[i] + box_w / 2, y = 2 - box_h / 2 - 0.05, xend = agg_x + box_w / 2, yend = box_h / 2 + 0.05,
+      arrow = ggplot2::arrow(length = grid::unit(0.10, "cm")), colour = "grey55", linewidth = 0.35
+    )
+  }
+  if (isTRUE(sequential)) {
+    for (i in seq_len(n - 1)) {
+      p <- p + ggplot2::geom_segment(
+        x = xs[i] + box_w, y = 2, xend = xs[i + 1], yend = 2,
+        arrow = ggplot2::arrow(length = grid::unit(0.13, "cm")), colour = "#D95F02", linewidth = 0.6
+      )
+    }
+  }
+  p + ggplot2::coord_equal(clip = "off") + ggplot2::theme_void() +
+    ggplot2::labs(title = title) +
+    ggplot2::theme(plot.title = ggplot2::element_text(face = "bold", size = 11, hjust = 0.5))
+}
+```
+
+
+::: {.callout-note title="Pour qui ?"}
+Cette section explique le gradient boosting sans supposer de connaissance préalable (elle suppose seulement qu'on sait à peu près ce qu'est un arbre de décision, cf. le tutoriel de la forêt aléatoire). Si vous connaissez déjà XGBoost, passez directement à la **Partie A**.
+:::
+
+## L'idée en une phrase
+
+> XGBoost construit un modèle en **ajoutant des petits arbres l'un après l'autre**, chaque nouvel arbre étant entraîné à **corriger les erreurs** commises par l'ensemble des arbres précédents.
+
+## Forêt aléatoire vs boosting : deux façons de combiner des arbres
+
+Les deux méthodes additionnent des arbres, mais avec des philosophies opposées.
+
+```{r}
+#| label: fig-bagboost
+#| fig-width: 9
+#| fig-height: 3.2
+#| fig-cap: "Bagging (forêt) vs boosting (XGBoost) : arbres indépendants moyennés, ou arbres séquentiels correcteurs."
+p_bag <- flow_diagram(
+  step_labels = c("Arbre 1", "Arbre 2", "Arbre 3", "Arbre 4"),
+  agg_label   = "MOYENNE\n(réduit la variance)",
+  title       = "Forêt aléatoire (bagging)\narbres indépendants",
+  sequential  = FALSE
+)
+p_boost <- flow_diagram(
+  step_labels = c("Arbre 1\n(court)", "Arbre 2\ncorrige 1", "Arbre 3\ncorrige 1+2", "...Arbre K"),
+  agg_label   = "SOMME pondérée par eta\n(réduit le biais)",
+  title       = "XGBoost (boosting)\narbres séquentiels",
+  sequential  = TRUE
+)
+p_bag | p_boost
+```
+
+
+
+-   La **forêt** entraîne de nombreux arbres **profonds**, **indépendants**, et **moyenne** leurs prédictions : la moyenne réduit la **variance** (l'instabilité de chaque arbre).
+-   Le **boosting** entraîne des arbres **courts**, **l'un après l'autre** : chacun corrige ce que les précédents ont mal prédit. Il réduit le **biais** (l'incapacité d'un arbre simple à épouser la structure des données).
+
+## Le boosting pas à pas
+
+Sur la figure ci-dessous, une seule variable $x$ et une réponse $y$ bruitée. Après **1 arbre**, la prédiction est une marche d'escalier grossière. Chaque arbre ajouté **affine** les marches là où l'erreur reste grande. Après **100 arbres** (avec un pas d'apprentissage volontairement grand ici), le modèle commence à **suivre le bruit** : les zigzags dans les zones sans signal sont du sur-apprentissage.
+
+```{r}
+#| label: fig-xgb-stages
+#| fig-width: 11
+#| fig-height: 3.3
+#| fig-cap: "Construction séquentielle (xgboost::xgb.train) : 1, 3, 10 puis 100 arbres de profondeur 2, avec un pas d'apprentissage volontairement grand pour que l'effet soit visible."
+set.seed(7)
+n3 <- 110
+x3 <- sort(runif(n3, 0, 10))
+y3_true <- 1.5 * pmax(x3 - 3, 0) * (x3 < 7) + 1.5 * 4 * (x3 >= 7) + 0.6 * sin(x3)
+y3 <- y3_true + rnorm(n3, 0, 0.8)
+df3 <- tibble::tibble(x = x3, y = y3)
+dtrain3 <- xgboost::xgb.DMatrix(data = as.matrix(df3["x"]), label = df3$y)
+grille3 <- tibble::tibble(x = seq(0, 10, length.out = 300))
+
+etapes <- c(1, 3, 10, 100)
+preds3 <- purrr::map_dfr(etapes, function(k) {
+  m <- xgboost::xgb.train(
+    params = list(objective = "reg:squarederror", max_depth = 2, eta = 0.3, nthread = 1),
+    data = dtrain3, nrounds = k, verbose = 0
+  )
+  tibble::tibble(x = grille3$x, pred = predict(m, as.matrix(grille3["x"])),
+                 arbres = factor(paste(k, "arbre(s)"), levels = paste(etapes, "arbre(s)")))
+})
+
+ggplot() +
+  geom_point(data = df3, aes(x, y), colour = "grey60", size = 1) +
+  geom_line(data = preds3, aes(x, pred), colour = "#1B9E77", linewidth = 1) +
+  facet_wrap(~ arbres, nrow = 1) +
+  labs(title = "Construction séquentielle : la prédiction s'affine à mesure qu'on ajoute des arbres",
+       subtitle = "eta = 0.3 (volontairement grand ici, pour que l'effet soit visible en peu d'arbres)",
+       x = "x", y = "y") +
+  theme_minimal(base_size = 11) +
+  theme(plot.subtitle = element_text(size = 8.5, colour = "grey40"), strip.text = element_text(face = "bold"))
+```
+
+
+
+Formellement, la prédiction est une **somme**
+
+$$\hat y(x) = \eta\,\big(f_1(x) + f_2(x) + \dots + f_K(x)\big)$$
+
+où chaque $f_k$ est un arbre court et $\eta$ (`eta`) est le **pas d'apprentissage** : on n'ajoute qu'une petite fraction de chaque correction, pour avancer prudemment.
+
+## Les trois réglages essentiels
+
+| Réglage | Rôle | Valeurs testées par défaut |
+|-----------------|-----------------------------|--------------------------|
+| `max_depth` | Profondeur des arbres = **ordre des interactions** que le modèle peut représenter. Profondeur 1 : effets **additifs** (une fonction par variable, sans interaction). Profondeur 2 : interactions de 2 variables. | 1, 2, 3 |
+| `eta` | Pas d'apprentissage : petit = prudent, demande plus d'arbres | 0,03 ; 0,1 |
+| `nrounds` | Nombre d'arbres | 10 à 300 |
+
+À ces trois réglages, le toolkit ajoute des garde-fous **fixes et prudents** : `subsample = 0,8` (chaque arbre ne voit que 80 % des patients, tirés au hasard : ce hasard diminue le sur-apprentissage), `lambda = 1` (pénalité sur l'amplitude des corrections), `min_child_weight = 1` (pas de feuille trop petite). Modifiables via `xgb_params = list(...)`.
+
+## Le danger : le sur-apprentissage
+
+Contrairement à la forêt (qui ne sur-apprend pas en ajoutant des arbres), le boosting **finit toujours par apprendre le bruit** si on ajoute trop d'arbres. La figure suit l'erreur sur les données d'entraînement (qui ne cesse de baisser) et sur des données non vues (qui plafonne, puis peut remonter). Le bon nombre d'arbres est celui du **minimum de l'erreur sur données non vues** -- ici environ 90 arbres pour la profondeur 1 et environ 35 pour la profondeur 4 : plus les arbres sont profonds, plus vite le modèle sur-apprend.
+
+```{r}
+#| label: fig-xgb-overfit
+#| fig-width: 9
+#| fig-height: 3.6
+#| fig-cap: "Sur-apprentissage : erreur d'entraînement et sur données non vues selon le nombre d'arbres, pour des arbres de profondeur 1 et 4 (xgboost::xgb.train, evaluation_log)."
+set.seed(1)
+n4 <- 160
+X4 <- matrix(runif(n4 * 3, 0, 10), ncol = 3)
+y4 <- 1.5 * pmax(X4[, 1] - 3, 0) + 0.8 * (X4[, 2] > 5) + rnorm(n4, 0, 1.0)
+idx_train <- sample.int(n4, n4 / 2)
+
+dtrain4 <- xgboost::xgb.DMatrix(data = X4[idx_train, ],  label = y4[idx_train])
+dtest4  <- xgboost::xgb.DMatrix(data = X4[-idx_train, ], label = y4[-idx_train])
+
+trajectoire <- function(profondeur) {
+  m <- xgboost::xgb.train(
+    params  = list(objective = "reg:squarederror", max_depth = profondeur, eta = 0.1, nthread = 1,
+                    eval_metric = "rmse"),
+    data    = dtrain4, nrounds = 400,
+    watchlist = list(entrainement = dtrain4, non_vues = dtest4),
+    verbose = 0
+  )
+  log <- m$evaluation_log
+  tibble::tibble(
+    iter = log$iter,
+    entrainement = log$entrainement_rmse,
+    non_vues     = log$non_vues_rmse,
+    profondeur   = profondeur
+  )
+}
+
+traj <- purrr::map_dfr(c(1, 4), trajectoire)
+meilleurs <- traj %>% dplyr::group_by(profondeur) %>% dplyr::slice_min(non_vues, n = 1, with_ties = FALSE)
+
+traj_long <- traj %>%
+  tidyr::pivot_longer(c(entrainement, non_vues), names_to = "jeu", values_to = "rmse") %>%
+  dplyr::mutate(jeu = factor(jeu, levels = c("entrainement", "non_vues"),
+                              labels = c("Entraînement", "Données non vues")))
+
+ggplot(traj_long, aes(iter, rmse, colour = jeu)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(data = meilleurs %>% dplyr::mutate(jeu = "Données non vues"),
+             aes(x = iter, y = non_vues), inherit.aes = FALSE, shape = 1, size = 3, stroke = 1.3, colour = "black") +
+  facet_wrap(~ profondeur, labeller = labeller(profondeur = function(v) paste("profondeur", v))) +
+  scale_colour_manual(values = c("Entraînement" = "#2C7FB8", "Données non vues" = "#B2182B")) +
+  labs(title = "Sur-apprentissage : erreur selon le nombre d'arbres",
+       subtitle = "Rond = meilleur nombre d'arbres (minimum sur données non vues)",
+       x = "Nombre d'arbres", y = "Erreur (RMSE)", colour = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(plot.subtitle = element_text(size = 8.5, colour = "grey40"), strip.text = element_text(face = "bold"))
+```
+
+
+
+Le toolkit ne devine pas ce nombre : il le choisit **dans chaque fold**, par validation croisée interne sur le jeu d'entraînement du fold (`.tune_xgb()`), en évaluant d'un seul entraînement **tous** les nombres d'arbres de la grille (on prédit avec les $k$ premiers arbres). Le fold de test externe n'intervient jamais dans ce choix :
+
+```{r}
+#| label: fig-nested-cv-xgb
+#| fig-width: 10
+#| fig-height: 2.5
+#| fig-cap: "Validation croisée imbriquée : le fold de test externe n'intervient jamais dans le réglage des hyperparamètres."
+chain_diagram(
+  labels = c("Train externe\n(fold k)", "CV interne\n(choix de max_depth,\neta, nrounds)",
+             "Test externe\n(fold k)\njamais vu du réglage", "Prédiction honnête\n(performance CV)"),
+  fills  = c("#F5F5F5", "#EEF3F8", "#FFF3E6", "#E8F5E9"),
+  title  = "Validation croisée imbriquée",
+  subtitle = "Le fold de test externe n'intervient jamais dans le réglage des hyperparamètres"
+)
+```
+
+
+
+## Valeurs manquantes : un avantage
+
+XGBoost traite **nativement** les valeurs manquantes des prédicteurs : à chaque split, il apprend de quel côté envoyer les patients dont la valeur est absente. Aucune imputation n'est nécessaire (contrairement au Lasso, à MARS et au SVM). La **réponse**, elle, ne doit pas être manquante. Attention : si l'absence est **informative** (ex. concentration sous la limite de détection), c'est utile, mais cela peut aussi créer un lien artificiel avec la réponse : à examiner.
+
+## Deux importances à ne pas confondre
+
+XGBoost fournit une importance **native**, le **gain** : contribution moyenne de la variable à la réduction de l'erreur dans les splits où elle intervient. Elle est **gratuite**, mais calculée sur les **données d'entraînement** : elle peut créditer une variable qui ne sert qu'à sur-apprendre, et elle favorise les variables continues.
+
+Le toolkit calcule donc **aussi** l'importance par **permutation sur les folds de test** (comme pour le SVM) :
+
+```{r}
+#| label: fig-perm-importance-xgb
+#| fig-width: 11
+#| fig-height: 2.3
+#| fig-cap: "Importance par permutation, calculée sur le fold de test."
+chain_diagram(
+  labels = c("Données de test\nintactes", "Prédiction\n→ erreur L0",
+             "1 variable\nmélangée", "Nouvelle prédiction\n→ erreur L1"),
+  fills  = c("#EEF3F8", "#EEF3F8", "#FFF3E6", "#FFF3E6"),
+  title  = "Importance par permutation",
+  subtitle = "Importance = erreur après mélange (L1) − erreur intacte (L0), moyennée sur les mélanges et les folds de test",
+  box_w = 2.6
+)
+```
+
+
+
+`importance_table_xgb()` affiche les deux côte à côte : une variable au gain élevé mais à l'importance de permutation nulle est suspecte (elle sert à sur-apprendre). Comme pour le SVM, `perm_groups` mesure l'importance d'un **groupe** de variables corrélées permutées d'un bloc, et `check_shap(fit, method = "xgb")` donne les valeurs de Shapley par patient -- avec le **même algorithme** que pour toutes les autres méthodes du toolkit (XGBoost sait aussi calculer un TreeSHAP exact, volontairement non utilisé ici pour garder des valeurs comparables entre méthodes).
+
+## XGBoost est-il pertinent pour des biomarqueurs (NULISAseq, Olink...) ?
+
+Aperçu rapide ; la section suivante détaille chaque point.
+
+-   ✅ Très utilisé en protéomique clinique, souvent avec SHAP ; gère nativement les valeurs manquantes et les interactions.
+-   ⚠️ Sur-apprend facilement à petit n ; réglage à surveiller via `check_hyperparam_stability_xgb()`.
+
+## Glossaire
+
+| Terme | Signification |
+|----------------------------|--------------------------------------------|
+| Boosting | Construction séquentielle d'un modèle où chaque élément corrige les erreurs des précédents |
+| `max_depth` | Profondeur maximale de chaque arbre |
+| `eta` | Pas d'apprentissage (fraction de chaque correction ajoutée) |
+| `nrounds` | Nombre d'arbres ajoutés |
+| `subsample` | Part des patients utilisée pour construire chaque arbre |
+| `lambda` | Pénalité (ridge) sur l'amplitude des corrections |
+| Gain | Contribution d'une variable à la réduction de l'erreur (importance native) |
+| Importance par permutation | Dégradation de la prédiction de patients non vus quand on brouille une variable |
+
+## Reproduire le boosting en R (jeu de données jouet)
+
+```{r xgb-toy}
+#| fig-width: 12
+#| fig-height: 3.6
+
+library(xgboost)
+set.seed(7)
+n <- 110
+d <- data.frame(x = sort(runif(n, 0, 10)))
+d$y <- 1.5 * pmax(pmin(d$x - 3, 4), 0) + 0.6 * sin(d$x) + rnorm(n, 0, 0.8)
+
+grille <- data.frame(x = seq(0, 10, length.out = 300))
+dtrain <- xgb.DMatrix(data = as.matrix(d["x"]), label = d$y)
+
+pred_par_nrounds <- purrr::map_dfr(c(1, 5, 20, 100), function(k) {
+  m <- xgb.train(params = list(objective = "reg:squarederror", max_depth = 2, eta = 0.3, nthread = 1),
+                 data = dtrain, nrounds = k, verbose = 0)
+  data.frame(x = grille$x, pred = predict(m, as.matrix(grille["x"])),
+             arbres = factor(paste(k, "arbre(s)"), levels = paste(c(1, 5, 20, 100), "arbre(s)")))
+})
+
+ggplot() +
+  geom_point(data = d, aes(x, y), colour = "grey60", size = 1) +
+  geom_line(data = pred_par_nrounds, aes(x, pred), colour = "#1B9E77", linewidth = 1) +
+  facet_wrap(~ arbres, nrow = 1) +
+  labs(title = "Boosting : la prédiction s'affine à mesure qu'on ajoute des arbres") +
+  theme_minimal()
+```
+
+## Pour aller plus loin
+
+-   **Chen & Guestrin (2016)**. *XGBoost: a scalable tree boosting system*. Proc. 22nd ACM SIGKDD, 785--794 -- l'article de l'algorithme.
+-   **Friedman (2001)**. *Greedy function approximation: a gradient boosting machine*. Annals of Statistics 29(5):1189--1232 -- l'article fondateur du gradient boosting.
+-   **Documentation XGBoost**, page « Introduction to Boosted Trees » (xgboost.readthedocs.io) -- une explication progressive de l'algorithme.
+-   **Boehmke & Greenwell**. *Hands-On Machine Learning with R*, chap. 12 « Gradient Boosting » (accès libre : bradleyboehmke.github.io/HOML/gbm.html).
+-   **Elith, Leathwick & Hastie (2008)**. *A working guide to boosted regression trees*. Journal of Animal Ecology 77:802--813 -- règles pratiques de réglage (petit `eta`, nombre d'arbres par validation croisée).
+-   **Lundberg & Lee (2017)**, *A unified approach to interpreting model predictions* (NeurIPS) ; **Lundberg et al. (2020)**, *From local explanations to global understanding with explainable AI for trees*, Nature Machine Intelligence 2:56--67 -- SHAP et TreeSHAP.
+-   Usage sur NULISA : préprint medRxiv 2025.12.02.25340706 (XGBoost sur le panel CNS de NULISA pour la classification d'étiologies de démence).
+
+# Avantages et limites de XGBoost
+
+::: {.callout-tip title="✅ Ce que XGBoost apporte"}
+- **Très utilisé en protéomique clinique**, souvent associé à SHAP -- y compris sur le panel CNS de NULISA pour distinguer des étiologies de démence (préprint medRxiv cité en références).
+- **Valeurs manquantes gérées nativement** : contrairement au Lasso, à MARS et au SVM, aucune imputation n'est requise pour les prédicteurs.
+- **Interactions possibles** (`max_depth` ≥ 2), et **profondeur 1 = modèle additif** lisible, testé automatiquement par la CV interne.
+- **Deux importances complémentaires** : le gain natif (rapide) et la permutation sur données non vues (honnête) -- affichées côte à côte par `importance_table_xgb()`.
+- **Régularisation explicite** (`eta`, `lambda`, sous-échantillonnage) : plus de leviers pour contrôler le compromis biais/variance qu'une forêt.
+:::
+
+::: {.callout-warning title="⚠️ Ce que XGBoost ne fait pas"}
+- **Sur-apprend facilement à petit n** (quelques dizaines de patients) : le boosting, contrairement au bagging, peut dégrader sa performance en ajoutant des arbres -- le réglage par CV interne est indispensable et reste bruité. Toujours consulter `check_hyperparam_stability_xgb()` (une profondeur 1 retenue presque partout indique un signal essentiellement additif, donc un XGBoost proche d'un GAM plutôt que d'une vraie forêt d'interactions).
+- **Pas de gain garanti sur la forêt aléatoire** : les deux méthodes apprennent des fonctions en marches d'escalier et donnent souvent des résultats proches sur un panel de taille modeste -- l'intérêt de `compare_methods()` est justement de vérifier s'il y a une différence réelle.
+- **Probabilités parfois sur-confiantes** (trop proches de 0/1) quand trop d'arbres sont retenus : vérifier systématiquement `plot_calibration_xgb()`.
+- **Boîte noire, aucune variable écartée** : comme la forêt et le SVM, l'interprétation passe entièrement par l'importance, `plot_effects_xgb()` ou SHAP.
+- **Plus de réglages sensibles** (`max_depth`, `eta`, `nrounds`) que la forêt (`mtry` seul) : plus de surface pour un mauvais réglage, compensée ici par une CV interne systématique et des valeurs par défaut prudentes.
+:::
+
+# Partie A : Régression -- progression du diabète
+
+```{r diab-load}
+library(lars)
+data(diabetes, package = "lars")
+
+diabetes_data <- as.data.frame(unclass(diabetes$x2))
+colnames(diabetes_data) <- make.names(colnames(diabetes_data), unique = TRUE)
+diabetes_data <- diabetes_data %>%
+  dplyr::mutate(y = diabetes$y, PatientID = as.character(dplyr::row_number()))
+
+dim(diabetes_data)
+```
+
+```{r diab-labels}
+# Dictionnaire de labels identique à celui des tutoriels Lasso et RF.
+labels_diabetes_base <- c(
+  age = "Âge", sex = "Sexe", bmi = "IMC", map = "Pression artérielle",
+  tc  = "Cholestérol total", ldl = "LDL", hdl = "HDL", tch = "Cholestérol/HDL",
+  ltg = "Triglycérides (log)", glu = "Glycémie"
+)
+
+labels_diabetes <- setNames(
+  vapply(colnames(diabetes_data), function(col) {
+    if (col %in% names(labels_diabetes_base)) return(labels_diabetes_base[[col]])
+    parts <- strsplit(col, "\\.")[[1]]
+    if (length(parts) == 2 && parts[2] == "2" && parts[1] %in% names(labels_diabetes_base)) {
+      return(paste0(labels_diabetes_base[[parts[1]]], "\u00b2"))
+    }
+    if (length(parts) == 2 && all(parts %in% names(labels_diabetes_base))) {
+      return(paste0(labels_diabetes_base[[parts[1]]], " \u00d7 ", labels_diabetes_base[[parts[2]]]))
+    }
+    col
+  }, character(1)),
+  colnames(diabetes_data)
+)
+```
+
+## Ajustement
+
+::: {.callout-tip title="📘 Comment ça marche"}
+`fit_xgb_repeated_cv(data, formula, id_col, v, repeats, seed)` a la même signature d'usage que les autres toolkits. Arguments propres à XGBoost : `max_depth_grid` (profondeurs d'arbre testées, `c(1, 2, 3)` par défaut), `eta_grid` (pas d'apprentissage testés, `c(0.03, 0.1)`), `nrounds_grid` (nombres d'arbres testés), `xgb_params` (autres paramètres xgboost), `importance` (`"permutation"` ou `"gain"` retenue dans `fold_importance` ; les deux sont toujours calculées) et `n_perm`. `perm_groups` (facultatif) permute un groupe de variables **d'un bloc** pour mesurer ce qu'elles apportent ensemble -- ici les 4 variables de cholestérol, fortement corrélées entre elles. La formule n'a pas besoin de `- 1`.
+:::
+
+```{r diab-fit}
+fit_xgb_diab <- fit_xgb_repeated_cv(
+  data    = diabetes_data,
+  formula = y ~ .,
+  id_col  = "PatientID",
+  v = 5, repeats = 20, seed = 42,
+  perm_groups = list(Cholesterol = c("tc", "ldl", "hdl", "tch")),
+  parallelisation = TRUE
+)
+
+print(fit_xgb_diab)
+```
+
+::: {.callout-note title="⏱️ Temps de calcul"}
+Chaque fold règle ses hyperparamètres par CV interne avant d'être ajusté : compter plusieurs minutes pour 100 folds sur ce jeu (n = 442, p = 64) ; `parallelisation = TRUE` répartit les folds sur plusieurs coeurs sans changer le résultat. Pour un essai rapide : `repeats = 3`.
+:::
+
+## Réglage des hyperparamètres
+
+Chaque fold choisit sa profondeur, son `eta` et son nombre d'arbres par CV interne. Trois questions : le **nombre d'arbres** est-il rarement au maximum de la grille ? La **profondeur** retenue est-elle stable (une profondeur 1 presque partout = signal additif) ? La courbe d'erreur **remonte-t-elle** quand on ajoute des arbres (sur-apprentissage) ?
+
+```{r diab-hyper}
+#| fig-width: 10
+#| fig-height: 5
+
+print(check_hyperparam_stability_xgb(fit_xgb_diab))
+plot_hyperparam_path_xgb(fit_xgb_diab)
+plot_hyperparam_stability_xgb(fit_xgb_diab)
+```
+
+## Performance
+
+```{r diab-perf}
+perf_xgb_diab <- model_performance.xgb_cv_fit(fit_xgb_diab)
+print(perf_xgb_diab)
+```
+
+```{r diab-pred-quality}
+#| fig-width: 9
+#| fig-height: 9
+
+plot_prediction_quality_xgb(fit_xgb_diab, mode = "panel")
+```
+
+Seules les prédictions des **folds de test** (`fold_predictions`) sont honnêtes ; le mode `"final"` montre le modèle final sur ses propres données d'entraînement, optimiste par construction.
+
+## Quelles variables comptent ? Importance par permutation
+
+::: {.callout-note title="📘 Comment lire ces sorties"}
+**Deux importances sont calculées** : la **permutation sur le fold de test** (retenue par défaut dans `fold_importance`, honnête car calculée sur des patients non vus) et le **gain natif** (calculé à l'entraînement, cf. Fondations). `importance_table_xgb()` les montre côte à côte. Chaque valeur de permutation est bruitée (un fold de test ne contient qu'environ n/5 patients) ; c'est la **moyenne sur les 100 folds** qui est informative. L'unité est celle de la réponse (dégradation du RMSE) ou du score de Brier en classification.
+
+Trois lectures complémentaires :
+
+-   `check_importance_xgb()` : importance moyenne et **stabilité du rang** (`rank_sd` faible = la variable est classée de façon cohérente d'un fold à l'autre) ;
+-   `plot_variable_importance_xgb()` : fréquence dans le top-K et amplitude de l'importance à travers les folds ;
+-   `group_importance_xgb()` : importance de **groupes** de variables permutés d'un bloc. Quand des variables sont corrélées (ici le cholestérol), chacune peut « remplacer » l'autre : leurs importances individuelles sont **diluées**, alors que celle du groupe ne l'est pas.
+:::
+
+```{r diab-importance}
+#| fig-width: 8
+#| fig-height: 9
+
+imp_xgb_diab <- check_importance_xgb(fit_xgb_diab, top_n = 20)
+print(imp_xgb_diab)
+plot_importance_xgb(imp_xgb_diab, labels = labels_diabetes, fit = fit_xgb_diab)
+```
+
+```{r diab-var-importance}
+#| fig-width: 10
+#| fig-height: 8
+
+plot_variable_importance_xgb(fit_xgb_diab, labels = labels_diabetes, top_k = 10, top_n = 20)
+```
+
+```{r diab-group-importance}
+group_importance_xgb(fit_xgb_diab)
+```
+
+```{r diab-imp-table}
+export_table(importance_table_xgb(fit_xgb_diab), caption = "Importance des variables (diabète, XGBoost)")
+```
+
+## Comment agissent-elles ? Forme des effets et SHAP
+
+```{r diab-effects}
+#| fig-width: 12
+#| fig-height: 7
+
+plot_effects_xgb(fit_xgb_diab, top_n = 6, labels = labels_diabetes)
+```
+
+::: {.callout-tip title="📘 Dépendance partielle et SHAP : deux façons de lire un effet"}
+La **dépendance partielle** trace la prédiction moyenne du modèle quand une variable varie (les autres gardant leurs valeurs) : sens et forme de l'effet **en moyenne**. Les **valeurs de Shapley** (`check_shap()`) attribuent, pour **chaque patient**, la part de sa prédiction due à chaque variable : elles montrent aussi l'hétérogénéité (une variable qui aide certains patients et pas d'autres). `check_shap()` utilise le **même algorithme Monte Carlo** pour toutes les méthodes du toolkit, donc les valeurs sont **comparables d'une méthode à l'autre**.
+:::
+
+```{r diab-shap}
+#| fig-width: 10
+#| fig-height: 8
+
+shap_xgb_diab <- check_shap(fit_xgb_diab, method = "xgb", nsim = 30, sample_size = 150)
+plot_shap(shap_xgb_diab, labels = labels_diabetes, top_n = 15, type = "beeswarm")
+```
+
+## Diagnostics de résidus (descriptifs)
+
+```{r diab-diagnostics}
+#| fig-width: 8
+#| fig-height: 6
+
+plot(check_independence_xgb(fit_xgb_diab))
+plot(check_normality_xgb(fit_xgb_diab))
+plot(check_heteroscedasticity_xgb(fit_xgb_diab))
+plot(check_outliers_xgb(fit_xgb_diab))
+```
+
+Comme pour la forêt et MARS, ces diagnostics sont **descriptifs** : le modèle est jugé sur sa performance de prédiction en CV, pas sur des hypothèses de normalité des résidus.
+
+## Vue d'ensemble : `check_model_xgb()`
+
+```{r diab-check-model}
+#| fig-width: 13
+#| fig-height: 15
+
+check_model_xgb(fit_xgb_diab, labels = labels_diabetes)
+```
+
+# Partie B : Classification -- diagnostic de la maladie d'Alzheimer
+
+```{r alz-load}
+library(AppliedPredictiveModeling)
+data(AlzheimerDisease)
+
+alzheimer_data <- predictors %>%
+  dplyr::mutate(diagnosis = diagnosis, PatientID = as.character(dplyr::row_number()))
+
+dim(alzheimer_data)
+table(alzheimer_data$diagnosis)
+```
+
+## Ajustement : `family = "binomial"`
+
+En classification, la réponse peut être un facteur à 2 niveaux : le second niveau est la classe « positive ». Le modèle utilise l'objectif `binary:logistic` : les prédictions sont directement des probabilités.
+
+```{r alz-fit}
+fit_xgb_alz <- fit_xgb_repeated_cv(
+  data    = alzheimer_data,
+  formula = diagnosis ~ .,
+  id_col  = "PatientID",
+  family  = "binomial",
+  v = 5, repeats = 20, seed = 42,
+  parallelisation = TRUE
+)
+
+print(fit_xgb_alz)
+```
+
+```{r alz-hyper}
+#| fig-width: 10
+#| fig-height: 5
+
+print(check_hyperparam_stability_xgb(fit_xgb_alz))
+plot_hyperparam_path_xgb(fit_xgb_alz)
+```
+
+## Performance : Accuracy, AUC, Brier
+
+```{r alz-perf}
+print(model_performance.xgb_cv_fit(fit_xgb_alz))
+```
+
+```{r alz-roc-pr-calib-confusion}
+#| fig-width: 7
+#| fig-height: 6
+
+plot_roc_xgb(fit_xgb_alz)
+plot_precision_recall_xgb(fit_xgb_alz)
+plot_calibration_xgb(fit_xgb_alz)
+plot_confusion_matrix_xgb(fit_xgb_alz)
+```
+
+La **courbe de calibration** compare la probabilité prédite à la fréquence observée : suivre la diagonale = probabilités interprétables. Le boosting est souvent sur-confiant (probabilités trop proches de 0 ou 1) quand trop d'arbres sont retenus.
+
+## Importance des biomarqueurs et forme des effets
+
+```{r alz-importance}
+#| fig-width: 9
+#| fig-height: 12
+
+imp_xgb_alz <- check_importance_xgb(fit_xgb_alz, top_n = 25)
+print(imp_xgb_alz)
+plot_importance_xgb(imp_xgb_alz)
+```
+
+```{r alz-effects}
+#| fig-width: 12
+#| fig-height: 7
+
+plot_effects_xgb(fit_xgb_alz, top_n = 6)
+```
+
+En classification, l'axe vertical de `plot_effects_xgb()` est la **probabilité prédite** : on lit directement comment le risque évolue avec le biomarqueur.
+
+```{r alz-shap}
+#| fig-width: 10
+#| fig-height: 8
+
+shap_xgb_alz <- check_shap(fit_xgb_alz, method = "xgb", nsim = 30, sample_size = 120)
+plot_shap(shap_xgb_alz, top_n = 15, type = "bar")
+```
+
+## Vue d'ensemble
+
+```{r alz-check-model}
+#| fig-width: 13
+#| fig-height: 15
+
+check_model_xgb(fit_xgb_alz)
+```
+
+# Lire les visualisations d'ensemble
+
+::: {.callout-note collapse="true" title="📘 Détail des graphiques combinés (cliquer pour déplier)"}
+**`check_model_xgb(fit)`** -- le grand panel combiné (4 à 6 vignettes selon `family`) :
+
+- *Régression* : qualité de prédiction (mode `"panel"`) · résidus vs valeurs prédites · Q-Q plot des résidus (descriptif) · Scale-Location (homoscédasticité, descriptif -- la régularisation du boosting peut élargir le résidu aux extrêmes de Y sans que ce soit un défaut de spécification).
+- *Classification* : qualité de prédiction · courbe ROC · courbe de calibration (à examiner en premier, cf. Fondations sur le sur-apprentissage) · matrice de confusion.
+- Dernière vignette : stabilité de l'importance à travers les folds (`check_importance_xgb()`, selon la métrique choisie par `importance =`).
+
+**`plot_prediction_quality_xgb(fit, mode = ...)`** -- mêmes 5 modes que le Lasso (`"pooled"`, `"pooled_mean"`, `"final"`, `"overlay"`, `"panel"`) : voir le détail dans `tutoriel_lasso_performance_toolkit.qmd`. Le mode `"final"` reste optimiste (modèle final réévalué sur ses propres données d'entraînement).
+
+**`importance_table_xgb(fit)`** -- gain natif ET permutation côte à côte (pas un graphique combiné, mais une table à lire ainsi : un gain élevé avec une permutation proche de 0 signale une variable qui sert surtout à sur-apprendre).
+
+**`group_importance_xgb(fit)`** -- une ligne par groupe défini dans `perm_groups` : `mean_importance` (positif = le groupe aide), `pct_folds_positive` (proche de 100% = effet consistant), `[q025 ; q975]` (dispersion entre folds -- PAS un intervalle de confiance sur de nouveaux patients).
+
+**Courbes ROC / calibration / matrice de confusion** : calculées sur les prédictions **poolées** de la CV (honnêtes) ; `plot_calibration_xgb()` est la vignette à examiner en premier pour ce modèle.
+:::
+
+# Et ensuite ?
+
+Comparer cette méthode aux autres **sur les mêmes folds** : `tutoriel_model_comparison_toolkit.qmd` (`compare_methods()`, `compare_importance()`, `compare_variable_selection()`, `compare_shap()`). Pour évaluer si un groupe de biomarqueurs **ajoute** de la prédiction à des variables cliniques, ajuster la même méthode avec deux formules sur les mêmes folds et les passer à `compare_methods()` (cf. `projet_pd_prediction_template.qmd`).
+
+# Références
+
+Cf. la section « Pour aller plus loin » des Fondations (en tête de ce document) pour la liste complète des références théoriques (Chen & Guestrin 2016, Friedman 2001, Elith et al. 2008, Lundberg & Lee 2017...). Références propres à l'interprétation et à la comparaison :
+
+- Fisher, A., Rudin, C., & Dominici, F. (2019). *All models are wrong, but many are useful: learning a variable's importance by studying an entire class of prediction models simultaneously.* Journal of Machine Learning Research, 20(177), 1–81. -- fondement de l'importance par permutation utilisée ici.
+- Štrumbelj, E., & Kononenko, I. (2014). *Explaining prediction models and individual predictions with feature contributions.* Knowledge and Information Systems, 41(3), 647–665. -- algorithme SHAP Monte Carlo utilisé par `check_shap()`.
+- Voir aussi `tutoriel_lasso_performance_toolkit.qmd`, `tutoriel_rf_performance_toolkit.qmd`, `tutoriel_mars_performance_toolkit.qmd`, `tutoriel_svm_performance_toolkit.qmd` et `tutoriel_model_comparison_toolkit.qmd` pour les autres méthodes de la série.

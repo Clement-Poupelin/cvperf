@@ -1,0 +1,876 @@
+---
+title: "MARS en validation croisée répétée"
+author: "Clément Poupelin"
+date: 09-21-2026
+date-modified: "`r Sys.Date()`"
+format: 
+  html:
+    embed-resources: false
+    toc: true
+    code-fold: true
+    code-summary: "Show the code"
+    code-tools: true
+    toc-location: right
+    page-layout: article
+    code-overflow: wrap
+number-sections: false
+editor: visual
+categories: ["Machine Learning", "MARS", "Non-Linear Models"]
+description: "Guide pratique du toolkit `mars_performance_toolkit.R`"
+execute: 
+  echo: true 
+  warning: false 
+  message: false
+  error: true
+---
+
+<!--
+=================================================================================
+tutoriel_mars_performance_toolkit.qmd
+=================================================================================
+Document AUTONOME, 3e volet "modèle" de la série (après les tutoriels Lasso et
+forêt aléatoire). 2 exemples, repris EXACTEMENT des tutoriels précédents (même
+jeu de données, même id_col, mêmes seed/v/repeats) pour rester directement
+comparables et alimenter tutoriel_model_comparison_toolkit.qmd :
+
+  A. Gaussienne,  p < n (p=64,  n=442) -- lars::diabetes
+  B. Binomiale,   p < n (p≈130, n=333) -- AppliedPredictiveModeling::AlzheimerDisease
+
+PRÉREQUIS
+---------
+install.packages(c("ISLR2", "AppliedPredictiveModeling", "lars", "earth", "ranger",
+                    "rsample", "dplyr", "tidyr", "purrr", "tibble",
+                    "ggplot2", "patchwork", "ggrepel", "nortest",
+                    "knitr", "viridis", "DT"))
+
+Le fichier mars_performance_toolkit.R doit se trouver dans le même dossier que
+ce document (installer le package : devtools::install("cvperf")). Les schémas de la section
+« Fondations » sont générés en R (ggplot2), directement dans ce document --
+aucun fichier image externe à télécharger.
+
+AVERTISSEMENT
+-------------
+Comme les toolkits, ce document n'a pas pu être exécuté dans l'environnement
+de rédaction (pas de runtime R) : un aller-retour de débogage au premier
+render est possible.
+=================================================================================
+-->
+
+```{r setup}
+#| include: false
+
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(tibble)
+library(ggplot2)
+library(patchwork)
+library(earth)
+library(rsample)
+library(ggrepel)
+library(nortest)
+library(viridis)
+library(knitr)
+library(DT)
+
+library(cvperf)
+```
+
+```{r export-table-helper}
+#| include: false
+
+export_table <- function(df, caption = NULL, page_length = 10) {
+  DT::datatable(
+    df, caption = caption, rownames = FALSE, filter = "top",
+    extensions = "Buttons",
+    options = list(dom = "Bfrtip", buttons = c("csv", "excel"),
+                   pageLength = page_length, scrollX = TRUE)
+  )
+}
+```
+
+# Pourquoi ce tutoriel
+
+`lasso_performance_toolkit_V3.R` couvre un modèle **linéaire parcimonieux**, `rf_performance_toolkit.R` un modèle **non linéaire boîte noire**. `mars_performance_toolkit.R` couvre la case restante de la matrice : un modèle **non linéaire parcimonieux et lisible**.
+
+|  | **Parcimonieux / lisible** | **Boîte noire** |
+|------------------|--------------------------|--------------------------|
+| **Linéaire** | Lasso | *(non couvert)* |
+| **Non linéaire** | **MARS** | Forêt aléatoire |
+
+Le toolkit garde exactement la même architecture que les 2 autres : même signature d'usage, mêmes noms de champs dans l'objet retourné (`data`, `formula`, `fold_predictions`, `final_model`...), mêmes diagnostics (`check_model_mars()`, `plot_prediction_quality_mars()`, `plot_roc_mars()`...), et même validation croisée répétée -- ce qui permet de passer le même objet `cv_repeats` aux 3 méthodes pour les comparer fold par fold (cf. `tutoriel_model_comparison_toolkit.qmd`).
+
+::: {.callout-tip title="📘 Vous ne connaissez pas MARS ? Lisez les Fondations en entier"}
+La section « Fondations » explique le modèle **de zéro** (aucun prérequis autre que la régression linéaire), avec des schémas : la fonction charnière, la construction du modèle, l'élagage, les interactions, la lecture d'une équation. Comptez ~15 minutes. Les parties A et B (plus bas) appliquent ensuite le toolkit sur les 2 jeux de données habituels.
+:::
+
+# Fondations : comprendre MARS de zéro
+
+```{r diagram-helpers}
+#| include: false
+
+# Petits schémas "boîtes + flèches" en ggplot2 pur (aucune dépendance
+# supplémentaire) -- remplace les anciens schémas SVG externes : tout est
+# recalculé ici, à chaque rendu, sans fichier à télécharger séparément.
+
+chain_diagram <- function(labels, fills = "#EEF3F8", title = NULL, subtitle = NULL,
+                           box_w = 2.8, box_h = 1.3, size = 3.1) {
+  n <- length(labels)
+  fills <- rep_len(fills, n)
+  boxes <- tibble::tibble(x = seq(0, by = box_w + 0.5, length.out = n), y = 0, label = labels, fill = fills)
+  arrows <- tibble::tibble(x = boxes$x[-n] + box_w, xend = boxes$x[-1], y = box_h / 2, yend = box_h / 2)
+  ggplot2::ggplot() +
+    ggplot2::geom_rect(data = boxes, ggplot2::aes(xmin = x, xmax = x + box_w, ymin = y, ymax = y + box_h, fill = fill),
+                        color = "grey30") +
+    ggplot2::geom_text(data = boxes, ggplot2::aes(x = x + box_w / 2, y = y + box_h / 2, label = label),
+                        size = size, lineheight = 0.9) +
+    ggplot2::geom_segment(data = arrows, ggplot2::aes(x = x, y = y, xend = xend, yend = yend),
+                           arrow = ggplot2::arrow(length = grid::unit(0.18, "cm")), linewidth = 0.6) +
+    ggplot2::scale_fill_identity() +
+    ggplot2::coord_equal(clip = "off") +
+    ggplot2::theme_void() +
+    ggplot2::labs(title = title, subtitle = subtitle) +
+    ggplot2::theme(plot.subtitle = ggplot2::element_text(colour = "grey45", size = 9),
+                   plot.title    = ggplot2::element_text(face = "bold"))
+}
+
+# Diagramme "en éventail" : plusieurs boîtes du haut convergent vers UNE
+# boîte du bas (bagging), ou s'enchaînent en plus en haut (boosting).
+flow_diagram <- function(step_labels, agg_label, title = NULL, sequential = FALSE,
+                          box_w = 1.5, box_h = 0.9, top_fill = "#E8F5E9", agg_fill = "#EEF3F8") {
+  n  <- length(step_labels)
+  xs <- seq(0, by = box_w + 0.35, length.out = n)
+  boxes <- tibble::tibble(x = xs, y = 2, label = step_labels)
+  agg_x <- mean(xs)
+  agg   <- tibble::tibble(x = agg_x, y = 0, label = agg_label)
+
+  p <- ggplot2::ggplot() +
+    ggplot2::geom_rect(data = boxes, ggplot2::aes(xmin = x, xmax = x + box_w, ymin = y - box_h / 2, ymax = y + box_h / 2),
+                        fill = top_fill, color = "grey30") +
+    ggplot2::geom_text(data = boxes, ggplot2::aes(x = x + box_w / 2, y = y, label = label), size = 2.7, lineheight = 0.85) +
+    ggplot2::geom_rect(data = agg, ggplot2::aes(xmin = x - 0.1, xmax = x + box_w + 0.1, ymin = y - box_h / 2, ymax = y + box_h / 2),
+                        fill = agg_fill, color = "grey30") +
+    ggplot2::geom_text(data = agg, ggplot2::aes(x = x + box_w / 2, y = y, label = label), size = 2.9, lineheight = 0.85)
+
+  for (i in seq_len(n)) {
+    p <- p + ggplot2::geom_segment(
+      x = xs[i] + box_w / 2, y = 2 - box_h / 2 - 0.05, xend = agg_x + box_w / 2, yend = box_h / 2 + 0.05,
+      arrow = ggplot2::arrow(length = grid::unit(0.10, "cm")), colour = "grey55", linewidth = 0.35
+    )
+  }
+  if (isTRUE(sequential)) {
+    for (i in seq_len(n - 1)) {
+      p <- p + ggplot2::geom_segment(
+        x = xs[i] + box_w, y = 2, xend = xs[i + 1], yend = 2,
+        arrow = ggplot2::arrow(length = grid::unit(0.13, "cm")), colour = "#D95F02", linewidth = 0.6
+      )
+    }
+  }
+  p + ggplot2::coord_equal(clip = "off") + ggplot2::theme_void() +
+    ggplot2::labs(title = title) +
+    ggplot2::theme(plot.title = ggplot2::element_text(face = "bold", size = 11, hjust = 0.5))
+}
+```
+
+## 1.1 L'idée en une phrase
+
+> **MARS est une régression linéaire « brisée » : au lieu d'une seule droite, il ajuste une ligne composée de plusieurs segments, et c'est l'algorithme lui-même qui choisit *quelles variables* utiliser et *où* casser la ligne.**
+
+Pour chaque variable retenue, le modèle peut ainsi dire : « en dessous de tel seuil, l'effet est faible ; au-dessus, il devient fort » -- sans que vous ayez eu à spécifier ce seuil à l'avance.
+
+## 1.2 Le point de départ : ce que ne sait pas faire une droite
+
+Une régression linéaire (ou un Lasso) attribue **une seule pente** à chaque variable : augmenter x de 1 unité change y de la même quantité partout. Or, dans les données biologiques, les relations changent souvent de régime : une protéine sans effet tant que son taux reste bas, puis un effet marqué au-delà d'un seuil ; un effet qui plafonne ; etc.
+
+```{r}
+#| label: fig-hinge
+#| fig-width: 10
+#| fig-height: 3.4
+#| fig-cap: "A : une droite unique s'écarte des données quand la pente change. B : la brique élémentaire de MARS, la « fonction charnière ». C : en additionnant deux charnières pondérées, on obtient une ligne brisée qui suit les données. Données simulées, illustration."
+set.seed(1)
+x <- seq(0, 10, length.out = 200)
+k <- 4
+y_true <- 0.3 * x + 2 * pmax(x - k, 0)
+df1 <- tibble::tibble(x = x, y = y_true + rnorm(200, 0, 0.4))
+
+fit_lm1 <- lm(y ~ x, data = df1)
+df1$pred_lm    <- predict(fit_lm1)
+df1$pred_hinge <- 0.3 * x - 0.2 + 2 * pmax(x - k, 0)
+
+hinge_df <- tibble::tibble(x = x, h = pmax(x - k, 0))
+
+p1a <- ggplot(df1, aes(x, y)) +
+  geom_point(alpha = 0.35, size = 1) +
+  geom_line(aes(y = pred_lm), colour = "#B2182B", linewidth = 1) +
+  labs(title = "A. Une droite unique", subtitle = "Elle ne peut pas suivre le\nchangement de pente en x = 4") +
+  theme_minimal(base_size = 10) + theme(plot.subtitle = element_text(size = 8, colour = "grey40"))
+
+p1b <- ggplot(hinge_df, aes(x, h)) +
+  geom_line(colour = "#2C7FB8", linewidth = 1.1) +
+  geom_vline(xintercept = k, linetype = "dashed", colour = "grey50") +
+  labs(title = "B. Fonction charnière h(x-4)", subtitle = "0 avant le noeud, pente 1 après") +
+  theme_minimal(base_size = 10) + theme(plot.subtitle = element_text(size = 8, colour = "grey40"))
+
+p1c <- ggplot(df1, aes(x, y)) +
+  geom_point(alpha = 0.35, size = 1) +
+  geom_line(aes(y = pred_hinge), colour = "#1B9E77", linewidth = 1) +
+  geom_vline(xintercept = k, linetype = "dashed", colour = "grey50") +
+  labs(title = "C. Somme de charnières", subtitle = "Suit le changement de pente") +
+  theme_minimal(base_size = 10) + theme(plot.subtitle = element_text(size = 8, colour = "grey40"))
+
+p1a | p1b | p1c
+```
+
+
+## 1.3 La brique élémentaire : la fonction charnière (*hinge function*)
+
+Une charnière est une fonction très simple, **nulle d'un côté d'un point appelé noeud (*knot*) $k$, et linéaire de l'autre** :
+
+$$h(x - k) = \max(0,\; x - k) \qquad\text{et son symétrique}\qquad h(k - x) = \max(0,\; k - x)$$
+
+Exemple numérique avec $k = 5$ :
+
+| x | 2 | 4 | 5 | 6 | 8 |
+|----------------|----|----|----|----|----|
+| $h(x-5)=\max(0,x-5)$ | 0 | 0 | 0 | 1 | 3 |
+| $h(5-x)=\max(0,5-x)$ | 3 | 1 | 0 | 0 | 0 |
+
+Chaque charnière « s'active » d'un seul côté du noeud. En pondérant et en additionnant plusieurs charnières (panneau C de la figure 1), on obtient une ligne dont **la pente change à chaque noeud** : voilà tout le modèle. Un modèle MARS s'écrit donc :
+
+$$\hat{y} \;=\; \beta_0 \;+\; \beta_1\,B_1(x) \;+\; \beta_2\,B_2(x) \;+\; \dots \;+\; \beta_M\,B_M(x)$$
+
+où chaque $B_m$ (« fonction de base ») est une charnière -- ou, si l'on autorise les interactions, un produit de charnières (section 1.6).
+
+## 1.4 Construire le modèle : la passe avant (*forward pass*)
+
+Comment l'algorithme trouve-t-il les bons noeuds ? Par une recherche **gloutonne** (*greedy*) : à chaque étape, il essaie « toutes » les possibilités et garde la meilleure.
+
+1.  Départ : un modèle avec **seulement l'intercept** (la moyenne de y).
+2.  À chaque étape, pour chaque variable et chaque noeud candidat (les valeurs observées de la variable, espacées d'au moins `minspan` observations dans `{earth}`), on teste l'ajout de la **paire** de charnières $h(x-k)$ et $h(k-x)$.
+3.  On garde la paire (variable, noeud) qui **réduit le plus l'erreur** (RSS), on recalcule tous les coefficients par moindres carrés, et on recommence.
+4.  On s'arrête quand on atteint le nombre maximal de termes (`nk`), ou quand l'ajout d'une paire n'améliore presque plus l'ajustement (`thresh`, 0.001 par défaut dans `{earth}`).
+
+```{r}
+#| label: fig-forward
+#| fig-width: 11
+#| fig-height: 3.3
+#| fig-cap: "La passe avant sur un exemple simulé (1 seule variable) : chaque paire de charnières ajoutée réduit l'erreur (RSS). La 3e paire n'apporte presque rien -- rôle de la passe arrière de la retirer."
+set.seed(2)
+n2 <- 120
+x2 <- sort(runif(n2, 0, 10))
+y2_true <- 1.2 * pmax(x2 - 3, 0) - 0.8 * pmax(x2 - 7, 0)
+df2 <- tibble::tibble(x = x2, y = y2_true + rnorm(n2, 0, 0.5))
+
+steps <- c(1, 3, 5, 7)
+preds2 <- purrr::map_dfr(steps, function(np) {
+  m <- earth::earth(y ~ x, data = df2, degree = 1, nprune = np, pmethod = "none")
+  tibble::tibble(x = x2, pred = as.numeric(predict(m)), n_terms = np)
+})
+
+ggplot(df2, aes(x, y)) +
+  geom_point(alpha = 0.3, size = 0.8) +
+  geom_line(data = preds2, aes(x, pred), colour = "#D95F02", linewidth = 1) +
+  facet_wrap(~ n_terms, nrow = 1, labeller = labeller(n_terms = function(v) paste(v, "terme(s)"))) +
+  labs(title = "Passe avant : ajout progressif de paires de charnières",
+       subtitle = "3e étape : colle presque au bruit -- rôle de la passe arrière de la retirer",
+       x = "x", y = "y") +
+  theme_minimal(base_size = 11) +
+  theme(plot.subtitle = element_text(size = 8.5, colour = "grey40"), strip.text = element_text(face = "bold"))
+```
+
+
+::: {.callout-note title="🔍 Pourquoi « en paires » ?"}
+Ajouter $h(x-k)$ **et** $h(k-x)$ ensemble permet au modèle de changer de pente des deux côtés du noeud. Par la suite, la passe arrière est libre de ne garder qu'un seul des deux termes d'une paire -- c'est d'ailleurs fréquent, et c'est ce qui donne des modèles où un noeud n'apparaît qu'avec une charnière.
+:::
+
+À la fin de la passe avant, le modèle est **volontairement trop riche** : il a de nombreux termes, dont certains ne servent qu'à coller au bruit (sur-apprentissage). D'où la deuxième étape.
+
+## 1.5 Élaguer : la passe arrière (*backward pass*) et le critère GCV
+
+La passe arrière fait l'inverse : elle part du gros modèle et **retire un terme à la fois** -- celui dont la suppression dégrade le moins l'ajustement -- ce qui donne une suite de modèles de plus en plus petits. Reste à choisir *lequel garder*. Comme l'erreur sur les données d'entraînement baisse toujours quand on ajoute des termes, on ne peut pas s'y fier : MARS utilise le **GCV** (*Generalized Cross-Validation*, Craven & Wahba 1978), une erreur **pénalisée par la complexité** :
+
+$$\text{GCV}(M) \;=\; \frac{\text{RSS}/n}{\bigl(1 - C(M)/n\bigr)^2}, \qquad C(M) = M + \text{penalty}\times(\text{nombre de noeuds})$$
+
+Plus le modèle est complexe (grand $C(M)$), plus le dénominateur est petit et plus le GCV est grand : le GCV **remonte** quand on garde trop de termes, et on retient le sous-modèle qui **minimise** le GCV.
+
+```{r}
+#| label: fig-gcv
+#| fig-width: 9
+#| fig-height: 3.4
+#| fig-cap: "Passe arrière sur l'exemple précédent, calculée avec earth::earth() : à gauche, l'erreur d'entraînement baisse toujours ; à droite, le GCV a un minimum -- c'est le modèle retenu."
+nprune_grid <- 2:12
+res_gcv <- purrr::map_dfr(nprune_grid, function(np) {
+  m <- earth::earth(y ~ x, data = df2, degree = 1, nprune = np, pmethod = "none")
+  tibble::tibble(nprune = np, rss = sum(residuals(m)^2), gcv = m$gcv)
+})
+meilleur <- res_gcv$nprune[which.min(res_gcv$gcv)]
+
+p3a <- ggplot(res_gcv, aes(nprune, rss)) +
+  geom_line(colour = "#2C7FB8") + geom_point(colour = "#2C7FB8") +
+  labs(title = "Erreur d'entraînement (RSS)", subtitle = "Diminue toujours : piège du sur-apprentissage",
+       x = "Nombre de termes", y = "RSS") +
+  theme_minimal(base_size = 11) + theme(plot.subtitle = element_text(size = 8.5, colour = "grey40"))
+
+p3b <- ggplot(res_gcv, aes(nprune, gcv)) +
+  geom_line(colour = "#D95F02") + geom_point(colour = "#D95F02") +
+  geom_vline(xintercept = meilleur, linetype = "dashed", colour = "grey40") +
+  labs(title = "GCV (Generalized Cross-Validation)",
+       subtitle = sprintf("Minimum à %d termes -> modèle retenu", meilleur),
+       x = "Nombre de termes", y = "GCV") +
+  theme_minimal(base_size = 11) + theme(plot.subtitle = element_text(size = 8.5, colour = "grey40"))
+
+p3a | p3b
+```
+
+
+La pénalité par noeud (`penalty`) est le réglage de « sévérité » de l'élagage : plus elle est grande, plus le modèle final est petit. La documentation de `{earth}` la fixe par défaut à 2 (sans interaction) ou 3 (avec), et indique que des valeurs entre 2 et 4 sont raisonnables ; **ce toolkit utilise 3 par défaut**.
+
+## 1.6 Les interactions : `degree = 2`
+
+Avec `degree = 1`, le modèle est **additif** : l'effet de chaque variable ne dépend pas des autres. Avec `degree = 2`, l'algorithme peut aussi multiplier deux charnières de variables différentes : $h(x_1 - a) \times h(x_2 - b)$. Ce terme n'est non nul que si **les deux** variables dépassent leur seuil -- c'est une interaction.
+
+```{r}
+#| label: fig-interaction
+#| fig-width: 8.5
+#| fig-height: 3.6
+#| fig-cap: "Deux protéines fictives A et B. À gauche (additif), les effets s'ajoutent en bandes. À droite (interaction), la réponse ne s'élève que si A et B dépassent tous les deux leur seuil."
+grid_int <- expand.grid(A = seq(0, 10, length.out = 60), B = seq(0, 10, length.out = 60))
+grid_int$additif     <- pmax(grid_int$A - 5, 0) + pmax(grid_int$B - 5, 0)
+grid_int$interaction <- pmax(grid_int$A - 5, 0) * pmax(grid_int$B - 5, 0) / 2.5
+
+p4a <- ggplot(grid_int, aes(A, B, fill = additif)) +
+  geom_raster() + scale_fill_viridis_c(option = "D") +
+  labs(title = "Additif : h(A) + h(B)", subtitle = "Zones d'égale valeur en bandes", fill = "Réponse") +
+  theme_minimal(base_size = 11) + theme(plot.subtitle = element_text(size = 8.5, colour = "grey40"))
+
+p4b <- ggplot(grid_int, aes(A, B, fill = interaction)) +
+  geom_raster() + scale_fill_viridis_c(option = "D") +
+  labs(title = "Interaction : h(A) × h(B)", subtitle = "Ne s'élève que si A ET B dépassent leur seuil", fill = "Réponse") +
+  theme_minimal(base_size = 11) + theme(plot.subtitle = element_text(size = 8.5, colour = "grey40"))
+
+p4a | p4b
+```
+
+
+::: {.callout-important title="⚠️ Les interactions sont un piège à petit n"}
+Chaque interaction ajoute beaucoup de flexibilité. Avec peu d'observations (quelques dizaines à quelques centaines), `degree = 2` est le premier suspect en cas de sur-apprentissage. Le toolkit **teste `degree = 1` et `degree = 2`** dans sa CV interne (`degree_grid = c(1, 2)`) et garde celui qui prédit le mieux ; `check_hyperparam_stability_mars()` et `plot_hyperparam_stability_mars()` montrent quel degré a été retenu, fold par fold. Si `degree = 1` gagne presque partout, le signal est essentiellement additif.
+:::
+
+## 1.7 Lire un modèle MARS : un exemple complet
+
+Voici un modèle **fictif** (mêmes conventions de notation que `{earth}`), qui prédit un score clinique $y$ à partir de deux variables, l'IMC et le LDL :
+
+$$\hat{y} = 140 \;+\; 8\cdot h(\text{IMC} - 26) \;-\; 3\cdot h(26 - \text{IMC}) \;+\; 5\cdot h(\text{LDL} - 3)$$
+
+| Terme | Signification en clair |
+|-------------------------|-------------------------------------------------|
+| `140` | Valeur de base (intercept) |
+| `8·h(IMC − 26)` | Au-dessus de IMC = 26, chaque point d'IMC ajoute **8** au score |
+| `−3·h(26 − IMC)` | En dessous de 26, chaque point d'IMC **en moins** retire 3 (donc l'effet est de sens opposé et 2,7 fois plus faible qu'au-dessus) |
+| `5·h(LDL − 3)` | Le LDL n'a **aucun effet** tant qu'il est ≤ 3 ; au-delà, +5 par unité |
+
+**Calcul pour un patient** (IMC = 30, LDL = 2,5) :
+
+| Terme | Calcul | Contribution |
+|----------------|-------------------------|--------------|
+| Intercept | 140 | 140 |
+| $8\cdot h(\text{IMC}-26)$ | $8 \times \max(0, 30-26) = 8 \times 4$ | 32 |
+| $-3\cdot h(26-\text{IMC})$ | $-3 \times \max(0, 26-30) = -3\times 0$ | 0 |
+| $5\cdot h(\text{LDL}-3)$ | $5 \times \max(0, 2{,}5-3) = 5 \times 0$ | 0 |
+| **Prédiction** | | **172** |
+
+Deux conséquences pratiques : (1) la **contribution d'une variable est exactement lisible** (contrairement à une forêt) ; (2) une variable qui n'apparaît dans aucun terme est **écartée** du modèle -- c'est ce qui rend MARS parcimonieux comme le Lasso. Dans le toolkit, la table des termes est `basis_table_mars(fit)` et les courbes de chaque effet sont `plot_effects_mars(fit)`.
+
+## 1.8 MARS, Lasso et forêt aléatoire sur les mêmes données
+
+```{r}
+#| label: fig-three-models
+#| fig-width: 8
+#| fig-height: 5
+#| fig-cap: "Lasso, MARS et forêt aléatoire ajustés sur les mêmes données simulées (effet de seuil puis plateau). Le Lasso ne peut tracer qu'une droite ; MARS retrouve les deux changements de régime avec des charnières lisibles ; la forêt suit aussi le seuil, mais en marches d'escalier, sans formule."
+set.seed(5)
+n5 <- 150
+x5 <- sort(runif(n5, 0, 10))
+y5_true <- ifelse(x5 < 3, 1, ifelse(x5 < 7, 1 + 1.5 * (x5 - 3), 1 + 1.5 * 4))
+df5 <- tibble::tibble(x = x5, y = y5_true + rnorm(n5, 0, 0.5))
+
+fit_lm5   <- lm(y ~ x, data = df5)
+fit_mars5 <- earth::earth(y ~ x, data = df5, degree = 1, nprune = 5)
+fit_rf5   <- ranger::ranger(y ~ x, data = df5, num.trees = 300)
+
+grid5 <- tibble::tibble(x = seq(0, 10, length.out = 300))
+grid5$Lasso <- as.numeric(predict(fit_lm5, newdata = grid5))
+grid5$MARS  <- as.numeric(predict(fit_mars5, newdata = grid5))
+grid5$Foret <- predict(fit_rf5, data = grid5)$predictions
+
+grid5_long <- tidyr::pivot_longer(grid5, -x, names_to = "Methode", values_to = "pred")
+
+ggplot(df5, aes(x, y)) +
+  geom_point(alpha = 0.25, size = 0.8) +
+  geom_line(data = grid5_long, aes(x, pred, colour = Methode), linewidth = 1) +
+  scale_colour_manual(values = c(Lasso = "#7570B3", MARS = "#D95F02", Foret = "#1B9E77"),
+                       labels = c(Lasso = "Lasso", MARS = "MARS", Foret = "Forêt aléatoire")) +
+  labs(title = "Lasso, MARS et forêt sur les mêmes données (seuil + plateau)",
+       subtitle = "MARS : 2 paires de charnières (nprune = 5) · Forêt : 300 arbres",
+       x = "x", y = "y", colour = NULL) +
+  theme_minimal(base_size = 12) + theme(plot.subtitle = element_text(colour = "grey45", size = 9))
+```
+
+
+| | **Lasso** | **MARS** | **Forêt aléatoire** |
+|---------------------|---------------------|---------------------|---------------------|
+| Forme de la relation | Droite (une pente par variable) | Ligne brisée (pente qui change aux noeuds) | Marches d'escalier moyennées |
+| Interactions | Non (sauf si vous les ajoutez à la main) | Oui, si `degree = 2` | Oui, automatiquement |
+| Élimine des variables | Oui (coefficient = 0) | Oui (variable dans aucun terme) | Non (importance faible, mais jamais nulle) |
+| Lisible | Coefficients | Termes charnière + courbes d'effet | Non (importance de permutation seulement) |
+| Hyperparamètres réglés ici | $\lambda$ | `degree`, `nprune` | `mtry` |
+| Point faible typique | Rate les seuils et les plafonds | Sélection instable si prédicteurs corrélés ; sur-apprend à `degree = 2` | Boîte noire ; probabilités « tassées » |
+
+## 1.9 Quand MARS est-il pertinent pour des données NULISAseq ?
+
+-   **Effets de seuil** : sur des NPQ (déjà en log₂), il est fréquent qu'une protéine n'ait d'effet qu'au-delà d'un certain niveau, ou qu'un plancher de détection crée un régime « non détecté » / « détecté ». Une charnière représente exactement cela, avec un seuil **lu** dans le modèle (utile pour discuter d'un cut-off).
+-   **Peu de variables utiles parmi beaucoup** : MARS écarte les protéines sans effet, comme le Lasso, mais sans imposer la linéarité.
+-   **Comparer Lasso ↔ MARS** : si MARS bat nettement le Lasso *et* que `check_complexity_mars()` montre de vraies charnières, c'est un argument pour une relation non linéaire ; si les deux sont équivalents, la relation est probablement linéaire.
+
+## 1.10 Glossaire
+
+| Terme | Définition courte |
+|----------------------|--------------------------------------------------|
+| **Noeud** (*knot*) | Valeur d'une variable où la pente du modèle change |
+| **Fonction charnière** (*hinge*) | $\max(0, x-k)$ ou $\max(0, k-x)$ : nulle d'un côté du noeud |
+| **Fonction de base** | Un terme du modèle : une charnière, ou un produit de charnières |
+| **Passe avant** | Ajout glouton de paires de charnières jusqu'à un modèle trop riche |
+| **Passe arrière** | Élagage terme par terme, retour à un modèle plus petit |
+| **GCV** | Erreur pénalisée par la complexité, critère d'élagage |
+| **`degree`** | Ordre maximal des interactions (1 = additif, 2 = interactions d'ordre 2) |
+| **`nprune`** | Nombre maximal de termes après élagage (intercept compris) |
+| **`penalty`** | Coût par noeud dans le GCV (plus grand → modèle plus petit) |
+| **`nk`** | Nombre maximal de termes créés par la passe avant |
+| **`minspan`** | Nombre minimal d'observations entre deux noeuds candidats |
+| **`evimp`** | Importance des variables dans `{earth}` (critères `gcv`, `rss`, `nsubsets`) |
+
+## 1.11 Reproduire les intuitions en R
+
+Ce chunk simule un effet de seuil et compare une droite, MARS et une forêt (équivalent en R de la figure 5). `format()` affiche le modèle MARS sous forme d'équation lisible ; `summary()` donne le nombre de termes, le GCV et le R² généralisé (`GRSq`).
+
+```{r toy-mars}
+#| fig-width: 12
+#| fig-height: 3.8
+
+set.seed(7)
+toy <- tibble::tibble(x = runif(110, 0, 10)) %>%
+  dplyr::mutate(y = 1.5 * pmin(pmax(x - 3, 0), 4) + rnorm(dplyr::n(), 0, 0.8))
+
+m_lm   <- lm(y ~ x, data = toy)
+m_mars <- earth::earth(y ~ x, data = toy, degree = 1, penalty = 3)
+
+grille <- tibble::tibble(x = seq(0, 10, length.out = 300))
+pred <- dplyr::bind_rows(
+  tibble::tibble(x = grille$x, y = predict(m_lm, grille), Modele = "Droite (Lasso / lm)"),
+  tibble::tibble(x = grille$x, y = as.numeric(predict(m_mars, grille)), Modele = "MARS")
+)
+
+# La forêt n'est tracée que si {ranger} est installé (non requis par ce toolkit)
+if (requireNamespace("ranger", quietly = TRUE)) {
+  m_rf <- ranger::ranger(y ~ x, data = toy, num.trees = 300, min.node.size = 3)
+  pred <- dplyr::bind_rows(pred, tibble::tibble(
+    x = grille$x, y = predict(m_rf, data = grille)$predictions, Modele = "Forêt aléatoire"))
+}
+
+ggplot(pred, aes(x, y)) +
+  geom_point(data = toy, colour = "grey55", alpha = 0.6, size = 1.2) +
+  geom_line(colour = "#D95F02", linewidth = 1.1) +
+  facet_wrap(~ Modele) +
+  labs(title = "Mêmes données, trois modèles", x = "x", y = "y") +
+  theme_minimal(base_size = 12)
+
+cat(format(m_mars))      # l'équation MARS, en clair
+summary(m_mars)          # nb de termes, GCV, GRSq
+```
+
+::: {.callout-tip title="📘 Lire summary() d'un modèle {earth}"}
+`Selected X of Y terms, and Z of W predictors` : MARS a gardé X termes sur les Y créés par la passe avant, en utilisant Z variables sur W. `GCV` est l'erreur pénalisée ; `GRSq` (R² généralisé, calculé à partir du GCV) est **plus honnête** que `RSq` (R² d'entraînement, optimiste) -- mais reste calculé sur les données d'entraînement : seule la CV externe du toolkit donne la vraie performance.
+:::
+
+## 1.12 Pour aller plus loin
+
+Ressources classées du plus accessible au plus technique (détails dans les références en fin de document) : chapitre 7 de *Hands-On Machine Learning with R* (Boehmke & Greenwell, en ligne, avec code `{earth}`) ; tutoriel *UC Business Analytics R Programming Guide* sur MARS ; vignette *Notes on the earth package* (Milborrow) pour toutes les options de `earth()` ; section 9.4 de *The Elements of Statistical Learning* pour la théorie ; article original de Friedman (1991) et l'introduction orientée applications médicales de Friedman & Roosen (1995).
+
+# Avantages et limites de MARS
+
+::: {.callout-tip title="✅ Ce que MARS apporte"}
+- **Non linéaire ET lisible** : contrairement à la forêt ou au SVM, le modèle final s'écrit comme une courte liste de termes explicites (`basis_table_mars()`) -- un seuil qu'on peut citer dans un article, pas seulement une prédiction.
+- **Sélection de variables intégrée**, comme le Lasso : une variable écartée par la passe arrière a un coefficient nul, pas juste faible.
+- **Capte les effets de seuil et paliers nativement** : particulièrement adapté à des NPQ avec un plancher de détection (cf. section 1.9).
+- **Diagnostic direct de la non-linéarité** : `check_complexity_mars()` répond littéralement à "MARS a-t-il trouvé un vrai changement de régime, ou se comporte-t-il comme une droite ?" -- une question que ni le Lasso ni la forêt ne peuvent poser aussi directement.
+:::
+
+::: {.callout-warning title="⚠️ Ce que MARS ne fait pas"}
+- **Aucune valeur manquante tolérée** : `{earth}` refuse les NA -- imputer ou retirer les lignes avant `fit_mars_repeated_cv()` (le toolkit s'arrête avec un message explicite).
+- **Sélection instable entre prédicteurs corrélés** : la recherche gloutonne choisit *une* variable parmi plusieurs quasi-équivalentes, et ce choix peut changer d'un fold à l'autre (cf. `check_selection_mars()`).
+- **Sur-apprentissage possible à petit n**, surtout avec `degree = 2` et un grand `nprune` -- se fier à la CV **externe**, jamais au R² d'entraînement du modèle final.
+- **Ligne brisée, pas courbe lisse** : les coudes aux noeuds sont un artefact de construction -- ne pas sur-interpréter la position exacte d'un noeud ni la pente entre deux noeuds proches.
+- **Pas d'incertitude native sur les coefficients** (pas d'équivalent direct d'un intervalle de confiance de régression classique) -- la CV répétée du toolkit en tient lieu (`plot_hyperparam_stability_mars()`).
+:::
+
+# Le toolkit : ce qu'il fait autour de MARS
+
+## Deux processus indépendants : boucle de CV et modèle final
+
+Comme pour le Lasso et la RF, `fit_mars_repeated_cv()` fait deux choses **indépendantes** :
+
+```{r}
+#| label: fig-algo-mars
+#| fig-width: 9
+#| fig-height: 2.3
+#| fig-cap: "Résumé de l'algorithme MARS en 2 passes (sections 1.4 et 1.5)."
+chain_diagram(
+  labels = c("Passe avant\n(ajoute des charnières\njusqu'à nk termes)",
+             "Passe arrière\n(élague selon le GCV)",
+             "Modèle final\n(termes retenus)"),
+  fills  = c("#EEF3F8", "#FFF3E6", "#E8F5E9"),
+  title  = "Algorithme MARS en 2 passes"
+)
+```
+
+```{r}
+#| label: fig-nested-cv-mars
+#| fig-width: 10
+#| fig-height: 2.3
+#| fig-cap: "Processus 1 du toolkit : dans chaque fold externe, degree et nprune sont réglés par une CV interne sur le train externe uniquement, puis le modèle est refit et prédit le test externe -- d'où une performance honnête. Processus 2 (non représenté) : le modèle final est ajusté une seule fois sur toutes les données ; c'est lui que l'on lit (basis_table_mars(), plot_effects_mars())."
+chain_diagram(
+  labels = c("Train externe\n(fold k)", "CV interne\n(choix de degree, nprune)",
+             "Test externe\n(fold k)\njamais vu du réglage", "Prédiction honnête\n(performance CV)"),
+  fills  = c("#F5F5F5", "#EEF3F8", "#FFF3E6", "#E8F5E9"),
+  title  = "Validation croisée imbriquée (processus 1 : boucle de CV répétée)",
+  subtitle = "Le fold de test externe n'intervient jamais dans le réglage des hyperparamètres"
+)
+```
+
+
+1.  la boucle de CV répétée (`v × repeats` folds) ne sert qu'à **évaluer** la méthode ;
+2.  le **modèle final**, ajusté sur toutes les données, sert à **lire** les termes et les courbes d'effet. Ses performances sur ses propres données d'entraînement sont optimistes ; seules les prédictions des folds de test (`fold_predictions`) sont honnêtes.
+
+# Partie A : Régression -- progression du diabète
+
+```{r diab-load}
+library(lars)
+data(diabetes, package = "lars")
+
+diabetes_data <- as.data.frame(unclass(diabetes$x2))
+colnames(diabetes_data) <- make.names(colnames(diabetes_data), unique = TRUE)
+diabetes_data <- diabetes_data %>%
+  dplyr::mutate(y = diabetes$y, PatientID = as.character(dplyr::row_number()))
+
+dim(diabetes_data)
+```
+
+```{r diab-labels}
+# Dictionnaire de labels identique à celui des tutoriels Lasso et RF.
+labels_diabetes_base <- c(
+  age = "Âge", sex = "Sexe", bmi = "IMC", map = "Pression artérielle",
+  tc  = "Cholestérol total", ldl = "LDL", hdl = "HDL", tch = "Cholestérol/HDL",
+  ltg = "Triglycérides (log)", glu = "Glycémie"
+)
+
+labels_diabetes <- setNames(
+  vapply(colnames(diabetes_data), function(col) {
+    if (col %in% names(labels_diabetes_base)) return(labels_diabetes_base[[col]])
+    parts <- strsplit(col, "\\.")[[1]]
+    if (length(parts) == 2 && parts[2] == "2" && parts[1] %in% names(labels_diabetes_base)) {
+      return(paste0(labels_diabetes_base[[parts[1]]], "\u00b2"))
+    }
+    if (length(parts) == 2 && all(parts %in% names(labels_diabetes_base))) {
+      return(paste0(labels_diabetes_base[[parts[1]]], " \u00d7 ", labels_diabetes_base[[parts[2]]]))
+    }
+    col
+  }, character(1)),
+  colnames(diabetes_data)
+)
+```
+
+## Ajustement
+
+::: {.callout-tip title="📘 Comment ça marche"}
+`fit_mars_repeated_cv(data, formula, id_col, v, repeats, seed)` a la même signature d'usage que `fit_lasso_repeated_cv()` et `fit_rf_repeated_cv()`. Arguments propres à MARS : `degree_grid = c(1, 2)` (degrés testés), `nprune_grid = NULL` (grille automatique), `penalty = 3`, `tuning = "cv"` (CV interne à `inner_v` folds) ou `"gcv"` (critère natif d'{earth}, plus rapide mais plus optimiste). Comme pour la RF, la formule n'a pas besoin de `- 1`.
+:::
+
+```{r diab-fit}
+fit_mars_diab <- fit_mars_repeated_cv(
+  data    = diabetes_data,
+  formula = y ~ .,
+  id_col  = "PatientID",
+  v = 5, repeats = 20, seed = 42,
+  parallelisation = TRUE
+)
+
+print(fit_mars_diab)
+```
+
+## Le modèle final, lisible : `basis_table_mars()`
+
+```{r diab-basis}
+export_table(basis_table_mars(fit_mars_diab), caption = "Termes charnière du modèle final -- diabète (MARS)")
+```
+
+::: {.callout-note title="📘 Comment lire la table des termes"}
+Chaque ligne est un terme du modèle final : `h(bmi-0.01)` vaut `max(0, bmi − 0.01)`, `h(0.01-bmi)` son symétrique ; un terme avec `*` est une interaction. Le coefficient est l'effet d'une unité de ce terme sur la réponse. Les variables **absentes** de cette table ont été écartées par MARS.
+:::
+
+## Nombre de termes et degré : `check_hyperparam_stability_mars()`
+
+```{r diab-hyperparam}
+#| fig-width: 8
+#| fig-height: 6
+
+print(check_hyperparam_stability_mars(fit_mars_diab))
+plot_hyperparam_path_mars(fit_mars_diab)
+plot_hyperparam_stability_mars(fit_mars_diab)
+```
+
+## MARS a-t-il trouvé du non-linéaire ? `check_complexity_mars()`
+
+```{r diab-complexity}
+check_complexity_mars(fit_mars_diab)
+```
+
+Lecture : le % de folds avec au moins une charnière, le % de folds avec au moins une interaction, et le nombre de termes médian. Si aucun fold ne retient d'interaction et que le nombre de termes est faible, le comportement est proche d'un modèle additif quasi linéaire.
+
+## Forme des effets : `plot_effects_mars()`
+
+```{r diab-effects}
+#| fig-width: 12
+#| fig-height: 7
+
+plot_effects_mars(fit_mars_diab, top_n = 6, labels = labels_diabetes)
+```
+
+::: {.callout-tip title="📘 Comment lire ces courbes"}
+Chaque panneau est la **dépendance partielle** du modèle final pour une variable retenue : la réponse prédite quand cette variable varie et que les autres sont moyennées. La droite pointillée est la meilleure droite de régression sur cette courbe : plus la courbe MARS s'en écarte, plus l'effet est réellement non linéaire ; une courbe qui la suit de près indique qu'un modèle linéaire suffisait pour cette variable. Contrairement à la RF, ces courbes sont **exactement** ce que fait le modèle (pas une approximation a posteriori).
+:::
+
+## Performance
+
+```{r diab-perf}
+perf_mars_diab <- model_performance.mars_cv_fit(fit_mars_diab)
+print(perf_mars_diab)
+```
+
+```{r diab-pred-quality-panel}
+#| fig-width: 9
+#| fig-height: 9
+
+plot_prediction_quality_mars(fit_mars_diab, mode = "panel")
+```
+
+Le mode `"final"` affiche le GCV du modèle final (plus honnête que le R² d'entraînement) ; les modes `"pooled"`, `"pooled_mean"` et `"overlay"` sont identiques à ceux des autres toolkits.
+
+## Sélection des variables : `check_selection_mars()` remplace le VIF
+
+::: {.callout-note title="📘 Équivalent de la stabilité de sélection du Lasso"}
+Pour chaque variable : % de folds où elle apparaît dans au moins un terme retenu (`pct_folds_used`), et son importance moyenne (critère GCV via `earth::evimp()`) quand elle est retenue. Un facteur multi-niveaux est regroupé sous sa variable d'origine. Une variable retenue dans ~100 % des folds est solide ; entre 20 et 80 %, la sélection gloutonne hésite (typique de prédicteurs corrélés) -- à interpréter avec prudence.
+:::
+
+```{r diab-selection}
+#| fig-width: 8
+#| fig-height: 10
+
+sel_mars_diab <- check_selection_mars(fit_mars_diab, top_n = 20)
+print(sel_mars_diab)
+plot_selection_mars(sel_mars_diab, labels = labels_diabetes)
+```
+
+```{r diab-var-importance}
+#| fig-width: 10
+#| fig-height: 8
+
+plot_variable_importance_mars(fit_mars_diab, labels = labels_diabetes, top_n = 15)
+```
+
+```{r diab-imp-table}
+export_table(importance_table_mars(fit_mars_diab), caption = "Variables par importance -- modèle final (diabète, MARS)")
+```
+
+## Diagnostics de résidus (descriptifs)
+
+::: {.callout-note title="📘 Interprétation"}
+Comme pour la RF, MARS est jugé sur sa performance de prédiction en CV : normalité, hétéroscédasticité et outliers sont des diagnostics **descriptifs**, pas des hypothèses du modèle. Un résultat "non normal" ne signale donc pas une mauvaise spécification. `check_independence_mars()` compare les résidus d'une observation d'une répétition à l'autre.
+:::
+
+```{r diab-diagnostics}
+#| fig-width: 8
+#| fig-height: 6
+
+plot(check_independence_mars(fit_mars_diab))
+plot(check_normality_mars(fit_mars_diab))
+plot(check_heteroscedasticity_mars(fit_mars_diab))
+plot(check_outliers_mars(fit_mars_diab))
+```
+
+## Vue d'ensemble : `check_model_mars()`
+
+```{r diab-check-model}
+#| fig-width: 13
+#| fig-height: 15
+
+check_model_mars(fit_mars_diab, labels = labels_diabetes)
+```
+
+::: {.callout-note title="📘 Pas de compare_models_mars()"}
+Contrairement aux toolkits Lasso/RF, il n'y a **pas** de `compare_models_mars()` dédié : `compare_methods()` de `model_comparison_toolkit.R` accepte n'importe quel mélange de `lasso_cv_fit`, `rf_cv_fit` et `mars_cv_fit` (y compris 2 MARS avec des formules différentes), sur les mêmes folds.
+:::
+
+# Partie B : Classification -- diagnostic de la maladie d'Alzheimer
+
+```{r alz-load}
+library(AppliedPredictiveModeling)
+data(AlzheimerDisease)
+
+alzheimer_data <- predictors %>%
+  dplyr::mutate(diagnosis = diagnosis, PatientID = as.character(dplyr::row_number()))
+
+dim(alzheimer_data)
+table(alzheimer_data$diagnosis)
+```
+
+## Ajustement : `family = "binomial"`
+
+::: {.callout-note title="📘 MARS binomial"}
+Avec `family = "binomial"`, {earth} sélectionne les termes charnière puis ajuste un **GLM binomial** dessus (`earth(..., glm = list(family = binomial))`) : la prédiction est une probabilité $P(Y=1\mid X)$, directement comparable à celle du Lasso et de la RF. `fit$positive_class` suit la même convention que les autres toolkits.
+:::
+
+```{r alz-fit}
+fit_mars_alz <- fit_mars_repeated_cv(
+  data    = alzheimer_data,
+  formula = diagnosis ~ .,
+  id_col  = "PatientID",
+  family  = "binomial",
+  v = 5, repeats = 20, seed = 42,
+  parallelisation = TRUE
+)
+
+print(fit_mars_alz)
+```
+
+```{r alz-basis}
+export_table(basis_table_mars(fit_mars_alz), caption = "Termes charnière du modèle final -- Alzheimer (MARS)")
+```
+
+```{r alz-complexity}
+check_complexity_mars(fit_mars_alz)
+```
+
+```{r alz-hyperparam}
+#| fig-width: 8
+#| fig-height: 6
+
+print(check_hyperparam_stability_mars(fit_mars_alz))
+plot_hyperparam_path_mars(fit_mars_alz)
+```
+
+## Performance : Accuracy, AUC, Brier
+
+```{r alz-perf}
+print(model_performance.mars_cv_fit(fit_mars_alz))
+```
+
+```{r alz-pred-quality}
+#| fig-width: 8
+#| fig-height: 6
+
+plot_prediction_quality_mars(fit_mars_alz, mode = "pooled")
+```
+
+## Biomarqueurs retenus et forme des effets
+
+```{r alz-selection}
+#| fig-width: 9
+#| fig-height: 12
+
+sel_mars_alz <- check_selection_mars(fit_mars_alz, top_n = 25)
+print(sel_mars_alz)
+plot_selection_mars(sel_mars_alz)
+```
+
+```{r alz-effects}
+#| fig-width: 12
+#| fig-height: 7
+
+plot_effects_mars(fit_mars_alz, top_n = 6)
+```
+
+En classification, l'axe vertical de `plot_effects_mars()` est la probabilité prédite : on lit directement comment le risque évolue avec le biomarqueur, avec ses éventuels seuils.
+
+## Courbes de classification
+
+```{r alz-roc-pr-calib-confusion}
+#| fig-width: 7
+#| fig-height: 6
+
+plot_roc_mars(fit_mars_alz)
+plot_precision_recall_mars(fit_mars_alz)
+plot_calibration_mars(fit_mars_alz)
+plot_confusion_matrix_mars(fit_mars_alz)
+```
+
+::: {.callout-note title="📘 Point de vigilance propre à MARS binomial"}
+Le GLM final est ajusté sur les termes retenus par la passe avant/arrière (qui, elle, ne connaît pas la déviance binomiale de la même façon) : avec `degree = 2` et un petit n, les probabilités peuvent devenir sur-confiantes (trop proches de 0 ou 1). Surveiller la courbe de calibration -- un patron opposé au "tassement vers 0.5" typique de la forêt de probabilité.
+:::
+
+## Vue d'ensemble
+
+```{r alz-check-model}
+#| fig-width: 13
+#| fig-height: 15
+
+check_model_mars(fit_mars_alz)
+```
+
+# Lire les visualisations d'ensemble
+
+::: {.callout-note collapse="true" title="📘 Détail des graphiques combinés (cliquer pour déplier)"}
+**`check_model_mars(fit)`** -- le grand panel combiné (4 à 6 vignettes selon `family`) :
+
+- *Régression* : qualité de prédiction (mode `"panel"`) · résidus vs valeurs prédites · Q-Q plot des résidus (descriptif -- un rappel spécifique à MARS : peu d'observations pour fixer les noeuds aux extrêmes de Y peut élargir le résidu sans que ce soit un défaut de spécification) · Scale-Location (homoscédasticité, descriptif).
+- *Classification* : qualité de prédiction · courbe ROC · courbe de calibration (attention à la saturation possible si le GLM sur-ajuste sur les termes retenus) · matrice de confusion.
+- Dernière vignette : stabilité de la **sélection** des variables à travers les folds (`check_selection_mars()`), l'équivalent MARS du VIF côté Lasso.
+
+**`plot_prediction_quality_mars(fit, mode = ...)`** -- mêmes 5 modes que le Lasso (`"pooled"`, `"pooled_mean"`, `"final"`, `"overlay"`, `"panel"`) : voir le détail dans `tutoriel_lasso_performance_toolkit.qmd`. Le mode `"final"` reste optimiste ; MARS ajoute son propre repère "honnête mais pénalisé" via le GCV du modèle final (`fit$final_model$gcv`), à ne pas confondre avec le R² d'entraînement.
+
+**`plot_effects_mars(fit)`** -- une facette par variable retenue : trait orange = dépendance partielle du modèle final, tirets gris = meilleure droite (l'écart entre les deux EST la non-linéarité détectée). Complémentaire du SHAP (`check_shap(method = "mars")`), qui décompose la même information individu par individu.
+
+**Courbes ROC / calibration / matrice de confusion** : calculées sur les prédictions **poolées** de la CV (honnêtes), comme pour les autres méthodes de la série.
+:::
+
+# Et ensuite ?
+
+Comparer MARS au Lasso et à la RF sur les mêmes folds : `tutoriel_model_comparison_toolkit.qmd` (`compare_methods()`, `compare_importance()`, `compare_variable_selection()`, `compare_shap()`...). Pour les valeurs de Shapley, `check_shap(fit_mars, method = "mars")` (shap_toolkit.R) applique le **même** algorithme Monte Carlo que pour les 2 autres méthodes.
+
+# Références
+
+## Pour découvrir MARS (du plus accessible au plus technique)
+
+-   Boehmke, B., & Greenwell, B. (2020). *Hands-On Machine Learning with R*, chapitre 7 « Multivariate Adaptive Regression Splines ». CRC Press. En ligne : <https://bradleyboehmke.github.io/HOML/mars.html> — Présentation pas à pas, avec code `{earth}`, réglage de `degree`/`nprune` et importance des variables. **Le meilleur point de départ en R.**
+-   *UC Business Analytics R Programming Guide*, « Multivariate Adaptive Regression Splines ». <https://uc-r.github.io/mars> — Tutoriel court et illustré, avec la logique de la fonction charnière.
+-   Kuhn, M., & Johnson, K. (2013). *Applied Predictive Modeling*. Springer, chapitre 7 (section MARS). — Comparaison de MARS avec les autres modèles non linéaires (réseaux de neurones, SVM, k plus proches voisins) et source du jeu de données `AlzheimerDisease` utilisé en partie B.
+-   Hastie, T., Tibshirani, R., & Friedman, J. (2009). *The Elements of Statistical Learning*, 2ᵉ éd., section 9.4. Springer. — Traitement théorique, lien avec la régression pas à pas et avec CART (arbres).
+
+## Documentation du package
+
+-   Milborrow, S. *Notes on the earth package* (vignette de `{earth}`). <https://cran.r-universe.dev/earth/doc/earth-notes.pdf> — Passe avant / arrière, conditions d'arrêt, modèles GLM (classification), facteurs, options `minspan`, `penalty`, `nk`, FAQ sur le GCV.
+-   Manuel de référence de `earth()` sur le CRAN : <https://cran.r-project.org/web/packages/earth/refman/earth.html> — Valeurs par défaut de `penalty` (2 sans interaction, 3 avec), `thresh`, `minspan`, `glm`.
+
+## Articles fondateurs
+
+-   Friedman, J. H. (1991). Multivariate Adaptive Regression Splines (avec discussion). *The Annals of Statistics*, 19(1), 1–67. <https://doi.org/10.1214/aos/1176347963> — L'algorithme MARS (passes avant / arrière, fonctions charnière, GCV).
+-   Friedman, J. H. (1993). *Fast MARS.* Technical Report 110, Department of Statistics, Stanford University. — Version accélérée de la passe avant, implémentée dans `{earth}`.
+-   Friedman, J. H., & Roosen, C. B. (1995). An introduction to multivariate adaptive regression splines. *Statistical Methods in Medical Research*, 4(3), 197–217. — Présentation orientée applications médicales.
+-   Craven, P., & Wahba, G. (1978). Smoothing noisy data with spline functions. *Numerische Mathematik*, 31, 377–403. — Origine du critère de validation croisée généralisée (GCV) utilisé pour l'élagage.
+
+## Exemples d'usage biomédical
+
+-   *Concentration-Dependent Antagonism and Culture Conversion in Pulmonary Tuberculosis*. PMC5411399. <https://www.ncbi.nlm.nih.gov/pmc/articles/PMC5411399/> — MARS y met en évidence une interaction avec seuils (Cmax de l'isoniazide × ratio Cmax/CMI de la rifampicine) que la régression logistique multivariée n'avait pas détectée : illustration concrète de « seuils + interactions » (section 1.6).
+
+## Les autres toolkits de la série
+
+-   Voir `tutoriel_lasso_performance_toolkit.qmd` (Lasso) et `tutoriel_rf_performance_toolkit.qmd` (forêt aléatoire), ainsi que `tutoriel_model_comparison_toolkit.qmd` pour comparer les 3 méthodes sur les mêmes folds.

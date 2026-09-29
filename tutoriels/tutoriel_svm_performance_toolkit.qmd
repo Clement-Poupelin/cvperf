@@ -1,0 +1,692 @@
+---
+title: "Performance et interprétation d'un SVM en validation croisée répétée"
+author: "Clément Poupelin"
+date: 09-21-2026
+date-modified: "`r Sys.Date()`"
+format: 
+  html:
+    embed-resources: false
+    toc: true
+    code-fold: true
+    code-summary: "Show the code"
+    code-tools: true
+    toc-location: right
+    page-layout: article
+    code-overflow: wrap
+number-sections: false
+editor: visual
+categories: [SVM, Machine Learning, Toolkit, Validation croisée, SHAP]
+description: "Tutoriel du toolkit svm_performance_toolkit.R : SVM à noyau gaussien, réglage (C, gamma) imbriqué, importance par permutation sur folds de test, importance de groupe, effets partiels et SHAP."
+execute: 
+  echo: true 
+  warning: false 
+  message: false
+  error: true
+---
+
+<!--
+=================================================================================
+tutoriel_svm_performance_toolkit.qmd
+=================================================================================
+Document AUTONOME, 4e volet "modèle" de la série (après Lasso, forêt et MARS).
+Mêmes 2 exemples que les tutoriels précédents (même jeu de données, id_col,
+seed/v/repeats) pour rester directement comparables :
+
+  A. Gaussienne,  p < n (p=64,  n=442) -- lars::diabetes
+  B. Binomiale,   p < n (p≈130, n=333) -- AppliedPredictiveModeling::AlzheimerDisease
+
+PRÉREQUIS
+---------
+install.packages(c("ISLR2", "AppliedPredictiveModeling", "lars", "e1071",
+                    "rsample", "dplyr", "tidyr", "purrr", "tibble",
+                    "ggplot2", "patchwork", "ggrepel", "nortest",
+                    "fastshap", "knitr", "viridis", "DT"))
+
+svm_performance_toolkit.R et shap_toolkit.R doivent se trouver dans le même
+dossier que ce document. Les schémas de la section « Fondations » sont
+générés en R (ggplot2/e1071), directement dans ce document -- aucun fichier
+image externe à télécharger.
+
+AVERTISSEMENT : comme les toolkits, ce document n'a pas pu être exécuté dans
+l'environnement de rédaction (pas de runtime R) : un aller-retour de débogage
+au premier render est possible.
+=================================================================================
+-->
+
+```{r setup}
+#| include: false
+
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(tibble)
+library(ggplot2)
+library(patchwork)
+library(e1071)
+library(rsample)
+library(ggrepel)
+library(nortest)
+library(viridis)
+library(knitr)
+library(DT)
+
+library(cvperf)
+```
+
+```{r export-table-helper}
+#| include: false
+
+export_table <- function(df, caption = NULL, page_length = 10) {
+  DT::datatable(
+    df, caption = caption, rownames = FALSE, filter = "top",
+    extensions = "Buttons",
+    options = list(dom = "Bfrtip", buttons = c("csv", "excel"),
+                   pageLength = page_length, scrollX = TRUE)
+  )
+}
+```
+
+# Fondations : comprendre le SVM de zéro
+
+```{r diagram-helpers}
+#| include: false
+
+# Petits schémas "boîtes + flèches" en ggplot2 pur (aucune dépendance
+# supplémentaire) -- remplace les anciens schémas SVG externes : tout est
+# recalculé ici, à chaque rendu, sans fichier à télécharger séparément.
+
+chain_diagram <- function(labels, fills = "#EEF3F8", title = NULL, subtitle = NULL,
+                           box_w = 2.8, box_h = 1.3, size = 3.1) {
+  n <- length(labels)
+  fills <- rep_len(fills, n)
+  boxes <- tibble::tibble(x = seq(0, by = box_w + 0.5, length.out = n), y = 0, label = labels, fill = fills)
+  arrows <- tibble::tibble(x = boxes$x[-n] + box_w, xend = boxes$x[-1], y = box_h / 2, yend = box_h / 2)
+  ggplot2::ggplot() +
+    ggplot2::geom_rect(data = boxes, ggplot2::aes(xmin = x, xmax = x + box_w, ymin = y, ymax = y + box_h, fill = fill),
+                        color = "grey30") +
+    ggplot2::geom_text(data = boxes, ggplot2::aes(x = x + box_w / 2, y = y + box_h / 2, label = label),
+                        size = size, lineheight = 0.9) +
+    ggplot2::geom_segment(data = arrows, ggplot2::aes(x = x, y = y, xend = xend, yend = yend),
+                           arrow = ggplot2::arrow(length = grid::unit(0.18, "cm")), linewidth = 0.6) +
+    ggplot2::scale_fill_identity() +
+    ggplot2::coord_equal(clip = "off") +
+    ggplot2::theme_void() +
+    ggplot2::labs(title = title, subtitle = subtitle) +
+    ggplot2::theme(plot.subtitle = ggplot2::element_text(colour = "grey45", size = 9),
+                   plot.title    = ggplot2::element_text(face = "bold"))
+}
+
+# Diagramme "en éventail" : plusieurs boîtes du haut convergent vers UNE
+# boîte du bas (bagging), ou s'enchaînent en plus en haut (boosting).
+flow_diagram <- function(step_labels, agg_label, title = NULL, sequential = FALSE,
+                          box_w = 1.5, box_h = 0.9, top_fill = "#E8F5E9", agg_fill = "#EEF3F8") {
+  n  <- length(step_labels)
+  xs <- seq(0, by = box_w + 0.35, length.out = n)
+  boxes <- tibble::tibble(x = xs, y = 2, label = step_labels)
+  agg_x <- mean(xs)
+  agg   <- tibble::tibble(x = agg_x, y = 0, label = agg_label)
+
+  p <- ggplot2::ggplot() +
+    ggplot2::geom_rect(data = boxes, ggplot2::aes(xmin = x, xmax = x + box_w, ymin = y - box_h / 2, ymax = y + box_h / 2),
+                        fill = top_fill, color = "grey30") +
+    ggplot2::geom_text(data = boxes, ggplot2::aes(x = x + box_w / 2, y = y, label = label), size = 2.7, lineheight = 0.85) +
+    ggplot2::geom_rect(data = agg, ggplot2::aes(xmin = x - 0.1, xmax = x + box_w + 0.1, ymin = y - box_h / 2, ymax = y + box_h / 2),
+                        fill = agg_fill, color = "grey30") +
+    ggplot2::geom_text(data = agg, ggplot2::aes(x = x + box_w / 2, y = y, label = label), size = 2.9, lineheight = 0.85)
+
+  for (i in seq_len(n)) {
+    p <- p + ggplot2::geom_segment(
+      x = xs[i] + box_w / 2, y = 2 - box_h / 2 - 0.05, xend = agg_x + box_w / 2, yend = box_h / 2 + 0.05,
+      arrow = ggplot2::arrow(length = grid::unit(0.10, "cm")), colour = "grey55", linewidth = 0.35
+    )
+  }
+  if (isTRUE(sequential)) {
+    for (i in seq_len(n - 1)) {
+      p <- p + ggplot2::geom_segment(
+        x = xs[i] + box_w, y = 2, xend = xs[i + 1], yend = 2,
+        arrow = ggplot2::arrow(length = grid::unit(0.13, "cm")), colour = "#D95F02", linewidth = 0.6
+      )
+    }
+  }
+  p + ggplot2::coord_equal(clip = "off") + ggplot2::theme_void() +
+    ggplot2::labs(title = title) +
+    ggplot2::theme(plot.title = ggplot2::element_text(face = "bold", size = 11, hjust = 0.5))
+}
+```
+
+
+::: {.callout-note title="Pour qui ?"}
+Cette section explique le SVM sans supposer de connaissance préalable. Si vous le connaissez déjà, passez directement à la **Partie A**. Pour un projet à quelques dizaines de patients et quelques variables (le cas typique d'une cohorte clinique avec un petit panel de protéines), c'est un modèle qui mérite d'être compris avant d'être utilisé.
+:::
+
+## L'idée en une phrase
+
+> Le SVM (*Support Vector Machine*, « machine à vecteurs de support ») prédit un nouveau patient en le comparant, par une mesure de **ressemblance**, à quelques patients « de référence » de l'échantillon d'entraînement : les **vecteurs de support**.
+
+Là où le Lasso écrit une équation, MARS une liste de règles à seuils et la forêt un vote d'arbres, le SVM raisonne par **similarité** : un patient est prédit proche de ceux qui lui ressemblent.
+
+## Une frontière qui laisse de la marge
+
+En classification, le SVM cherche la frontière qui sépare les deux groupes en laissant **la plus grande marge possible** de part et d'autre. Seuls les patients **proches de la frontière** la déterminent : ce sont les vecteurs de support (cerclés sur la figure). Les autres patients pourraient disparaître sans que la frontière ne bouge.
+
+Avec un **noyau linéaire**, la frontière est une droite (ou un plan) -- comme en régression logistique. Le **noyau gaussien** (« RBF », le choix par défaut du toolkit) autorise une frontière souple, qui épouse la structure des données.
+
+```{r}
+#| label: fig-svm-kernel
+#| fig-width: 9
+#| fig-height: 4
+#| fig-cap: "Noyau linéaire vs noyau gaussien (e1071::svm) sur les mêmes données : les points cerclés sont les vecteurs de support."
+set.seed(3)
+n1 <- 120
+theta <- runif(n1, 0, 2 * pi)
+r <- c(rnorm(n1 / 2, 1, 0.25), rnorm(n1 / 2, 3, 0.3))
+dfk <- tibble::tibble(x1 = r * cos(theta) + rnorm(n1, 0, 0.15),
+                       x2 = r * sin(theta) + rnorm(n1, 0, 0.15),
+                       y  = factor(rep(c("A", "B"), each = n1 / 2)))
+
+grille_k <- expand.grid(x1 = seq(min(dfk$x1) - 0.5, max(dfk$x1) + 0.5, length.out = 130),
+                         x2 = seq(min(dfk$x2) - 0.5, max(dfk$x2) + 0.5, length.out = 130))
+
+plot_kernel <- function(kernel, titre) {
+  m <- e1071::svm(y ~ x1 + x2, data = dfk, kernel = kernel, cost = 1, gamma = 1)
+  grille_k$pred <- predict(m, grille_k)
+  sv_idx <- m$index
+  ggplot() +
+    geom_raster(data = grille_k, aes(x1, x2, fill = pred), alpha = 0.25) +
+    geom_point(data = dfk, aes(x1, x2, colour = y), size = 1.3) +
+    geom_point(data = dfk[sv_idx, ], aes(x1, x2), shape = 1, size = 3, colour = "black", stroke = 0.6) +
+    scale_fill_manual(values = c(A = "#2C7FB8", B = "#D95F02"), guide = "none") +
+    scale_colour_manual(values = c(A = "#2C7FB8", B = "#D95F02")) +
+    labs(title = titre, subtitle = sprintf("%d vecteurs de support (cerclés)", length(sv_idx)), colour = NULL) +
+    coord_equal() + theme_minimal(base_size = 11) +
+    theme(plot.subtitle = element_text(size = 8.5, colour = "grey40"))
+}
+
+plot_kernel("linear", "Noyau linéaire : frontière = une droite") |
+  plot_kernel("radial", "Noyau gaussien (RBF) : frontière souple")
+```
+
+
+
+## Le noyau gaussien : mesurer la ressemblance
+
+Le noyau gaussien définit la ressemblance entre deux patients $x$ et $x'$ (variables standardisées) par
+
+$$K(x, x') = \exp\!\big(-\gamma\,\lVert x - x'\rVert^2\big)$$
+
+Cette valeur vaut 1 pour deux patients identiques et tend vers 0 quand ils s'éloignent. Le paramètre $\gamma$ règle la **portée** de la ressemblance :
+
+| $\gamma$ | Portée | Frontière obtenue |
+|----------------------|--------------------|----------------------------------|
+| petit | large : beaucoup de patients « se ressemblent » | presque une droite (lisse) |
+| grand | très courte : seuls les voisins immédiats comptent | très sinueuse, risque de sur-apprentissage |
+
+La prédiction pour un nouveau patient est une **somme pondérée de ses ressemblances** avec les vecteurs de support. Aucune formule explicite n'en sort : c'est ce qui fait du SVM une **boîte noire**, comme la forêt, mais à fonction **lisse**.
+
+## Les deux réglages essentiels : C et gamma
+
+-   **C** (`cost`) : sévérité envers les erreurs d'entraînement. **C grand** : le modèle veut classer correctement presque tous les patients d'entraînement (frontière tortueuse, risque de sur-apprentissage). **C petit** : il tolère des erreurs pour garder une frontière simple.
+-   **gamma** : portée de la ressemblance (cf. ci-dessus).
+
+Ils agissent **ensemble** : la figure ci-dessous montre une grille 3 × 3. En haut à droite (C petit, gamma grand) la frontière est nerveuse mais mal contrôlée ; en bas à droite (C grand, gamma grand) elle **entoure des points isolés** : c'est du sur-apprentissage caractérisé.
+
+```{r}
+#| label: fig-svm-cgamma
+#| fig-width: 8
+#| fig-height: 8
+#| fig-cap: "Effet de C (lignes) et de gamma (colonnes) sur la frontière de décision, sur les mêmes données que la figure précédente (e1071::svm, noyau radial)."
+Cs <- c(0.1, 1, 100)
+Gs <- c(0.05, 0.5, 10)
+grille_cg <- tidyr::expand_grid(C = Cs, gamma = Gs)
+
+res_cg <- purrr::pmap_dfr(grille_cg, function(C, gamma) {
+  m <- e1071::svm(y ~ x1 + x2, data = dfk, kernel = "radial", cost = C, gamma = gamma)
+  pred <- grille_k[, c("x1", "x2")]
+  pred$pred <- predict(m, pred)
+  pred$C <- C; pred$gamma <- gamma; pred$n_sv <- length(m$index)
+  pred
+})
+
+ggplot(res_cg, aes(x1, x2, fill = pred)) +
+  geom_raster(alpha = 0.3) +
+  geom_point(data = dfk, aes(x1, x2, colour = y), inherit.aes = FALSE, size = 0.7) +
+  facet_grid(rows = vars(sprintf("C = %s", C)), cols = vars(sprintf("gamma = %s", gamma))) +
+  scale_fill_manual(values = c(A = "#2C7FB8", B = "#D95F02"), guide = "none") +
+  scale_colour_manual(values = c(A = "#2C7FB8", B = "#D95F02"), guide = "none") +
+  labs(title = "Effet de C (lignes) et de gamma (colonnes) sur la frontière") +
+  coord_equal() + theme_minimal(base_size = 9) +
+  theme(strip.text = element_text(size = 8))
+```
+
+
+
+Le toolkit choisit le couple (C, gamma) **dans chaque fold**, par validation croisée interne sur le seul jeu d'entraînement du fold (`.tune_svm()`), puis mesure la performance sur le fold de test jamais vu :
+
+```{r}
+#| label: fig-nested-cv-svm
+#| fig-width: 10
+#| fig-height: 2.3
+#| fig-cap: "Validation croisée imbriquée : le fold de test externe n'intervient jamais dans le réglage des hyperparamètres."
+chain_diagram(
+  labels = c("Train externe\n(fold k)", "CV interne\n(choix de C, gamma)",
+             "Test externe\n(fold k)\njamais vu du réglage", "Prédiction honnête\n(performance CV)"),
+  fills  = c("#F5F5F5", "#EEF3F8", "#FFF3E6", "#E8F5E9"),
+  title  = "Validation croisée imbriquée",
+  subtitle = "Le fold de test externe n'intervient jamais dans le réglage des hyperparamètres"
+)
+```
+
+
+
+Deux garde-fous à connaître : `check_hyperparam_stability_svm()` signale une grille mal centrée (valeur retenue au bord) et une part de vecteurs de support proche de 100 % (le modèle **mémorise** ses données) ; `plot_hyperparam_path_svm()` montre la « vallée » d'erreur : plus elle est large, moins le résultat dépend d'un réglage fin.
+
+## En régression : le tube epsilon
+
+En régression, le SVM ignore les erreurs inférieures à $\varepsilon$ (`epsilon`, fixé à 0,1 sur la réponse standardisée) : seuls les patients **hors du tube** deviennent vecteurs de support. Ce paramètre a peu d'influence comparé à C et gamma ; le toolkit le fixe (modifiable par l'argument `epsilon`).
+
+## Standardiser est indispensable
+
+Le noyau repose sur des **distances** : une variable mesurée en milliers écraserait une variable mesurée en dixièmes. Le toolkit standardise donc chaque prédicteur (moyenne 0, écart-type 1) **avec les moyennes et écarts-types du jeu d'entraînement du fold**, appliqués tels quels au test : aucune information du test ne fuit dans l'ajustement. En régression, la réponse est standardisée puis remise à l'échelle.
+
+## Probabilités : Platt et calibration
+
+Le SVM produit naturellement un **score** (une distance à la frontière), pas une probabilité. `e1071` calibre ce score en probabilité par une régression logistique interne (**mise à l'échelle de Platt**). Conséquence pratique : **l'AUC**, qui ne dépend que de l'ordre des patients, est fiable ; les **probabilités brutes** le sont moins et doivent être vérifiées avec `plot_calibration_svm()` avant d'être interprétées (« ce patient a 80 % de risque »).
+
+## Pas de coefficients : comment lire le modèle ?
+
+Le SVM n'expose ni coefficient, ni importance native. Le toolkit calcule donc l'interprétation **à partir des prédictions seules**, sur les folds de test :
+
+```{r}
+#| label: fig-perm-importance-svm
+#| fig-width: 11
+#| fig-height: 2.3
+#| fig-cap: "Importance par permutation, calculée sur le fold de test."
+chain_diagram(
+  labels = c("Données de test\nintactes", "Prédiction\n→ erreur L0",
+             "1 variable\nmélangée", "Nouvelle prédiction\n→ erreur L1"),
+  fills  = c("#EEF3F8", "#EEF3F8", "#FFF3E6", "#FFF3E6"),
+  title  = "Importance par permutation",
+  subtitle = "Importance = erreur après mélange (L1) − erreur intacte (L0), moyennée sur les mélanges et les folds de test",
+  box_w = 2.6
+)
+```
+
+
+
+-   **Importance par permutation** : on brouille une variable et on mesure de combien la prédiction des patients **non vus** se dégrade. Une importance proche de 0 = le modèle n'en a pas besoin.
+-   **Importance de groupe** (`perm_groups`) : on brouille plusieurs variables **ensemble**. Indispensable quand elles sont corrélées : chacune peut remplacer l'autre, ce qui **dilue** leurs importances individuelles (phénomène bien décrit pour les forêts aléatoires par Strobl et al., 2008) alors que le groupe garde toute son importance.
+-   **Forme de l'effet** : dépendance partielle (`plot_effects_svm()`).
+-   **SHAP** : contribution de chaque variable à la prédiction de **chaque patient** (`check_shap(fit, method = "svm")`) -- même algorithme que pour toutes les autres méthodes, donc comparable.
+
+## Le SVM est-il pertinent pour des biomarqueurs (NULISAseq, Olink...) ?
+
+Aperçu rapide ; la section suivante détaille chaque point.
+
+-   ✅ Petit n, p modeste -- régime où le SVM à noyau lisse se comporte bien, souvent mieux que des arbres.
+-   ⚠️ Aucune valeur manquante tolérée, réglage bruité à très petit n, probabilités moins calibrées.
+
+## Glossaire
+
+| Terme | Signification |
+|----------------------------|--------------------------------------------|
+| Vecteur de support | Patient d'entraînement qui détermine la frontière (proche ou du mauvais côté) |
+| Marge | Distance entre la frontière et les patients les plus proches ; on cherche à la maximiser |
+| Noyau (*kernel*) | Fonction de ressemblance entre deux patients (linéaire, gaussien...) |
+| C (`cost`) | Sévérité envers les erreurs d'entraînement |
+| gamma | Portée de la ressemblance du noyau gaussien |
+| epsilon | Largeur du tube d'erreurs tolérées (régression) |
+| Platt | Transformation d'un score de SVM en probabilité |
+| Importance par permutation | Dégradation de la prédiction quand on brouille une variable |
+
+## Reproduire l'effet de C et gamma en R (jeu de données jouet)
+
+```{r svm-toy}
+#| fig-width: 10
+#| fig-height: 8
+
+library(e1071)
+set.seed(3)
+n  <- 200
+d  <- data.frame(x1 = rnorm(n), x2 = rnorm(n))
+d$y <- factor(ifelse(d$x1^2 + d$x2^2 + rnorm(n, 0, 0.5) > 1.6, "B", "A"))   # frontière circulaire
+
+grille <- expand.grid(x1 = seq(-3, 3, length.out = 120), x2 = seq(-3, 3, length.out = 120))
+reglages <- expand.grid(cost = c(0.1, 100), gamma = c(0.05, 10))
+
+pred_grille <- purrr::pmap_dfr(reglages, function(cost, gamma) {
+  m <- svm(y ~ x1 + x2, data = d, kernel = "radial", cost = cost, gamma = gamma)
+  grille %>% dplyr::mutate(pred = predict(m, grille), reglage = sprintf("C = %s · gamma = %s", cost, gamma))
+})
+
+ggplot() +
+  geom_raster(data = pred_grille, aes(x1, x2, fill = pred), alpha = 0.25) +
+  geom_point(data = d, aes(x1, x2, colour = y), size = 1.2) +
+  facet_wrap(~ reglage) +
+  scale_fill_manual(values = c("A" = "#2C7FB8", "B" = "#D95F02")) +
+  scale_colour_manual(values = c("A" = "#2C7FB8", "B" = "#D95F02")) +
+  labs(title = "Une frontière circulaire apprise avec 4 réglages de (C, gamma)", fill = "Prédit", colour = "Réel") +
+  theme_minimal()
+```
+
+## Pour aller plus loin
+
+-   **Cortes & Vapnik (1995)**. *Support-vector networks*. Machine Learning 20:273--297 -- l'article fondateur du SVM à marge souple (paramètre C).
+-   **Boser, Guyon & Vapnik (1992)**. *A training algorithm for optimal margin classifiers*. Proc. 5th Annual Workshop on Computational Learning Theory, 144--152 -- l'introduction des noyaux dans le SVM.
+-   **Hsu, Chang & Lin**. *A Practical Guide to Support Vector Classification* (Université nationale de Taïwan) -- le mode d'emploi des auteurs de libsvm : standardiser, noyau gaussien, recherche de (C, gamma) par validation croisée.
+-   **Chang & Lin (2011)**. *LIBSVM: a library for support vector machines*. ACM Transactions on Intelligent Systems and Technology 2(3):27 -- la bibliothèque appelée par `e1071`.
+-   **Platt (1999)**. *Probabilistic outputs for support vector machines and comparisons to regularized likelihood methods*. In: Advances in Large Margin Classifiers, MIT Press -- la calibration utilisée pour les probabilités.
+-   **Hastie, Tibshirani & Friedman**. *The Elements of Statistical Learning*, chap. 12 ; **James et al.**, *An Introduction to Statistical Learning*, chap. 9 (accès libre) ; **Kuhn & Johnson**, *Applied Predictive Modeling*, §7.3.
+-   **Strobl, Boulesteix, Kneib, Augustin & Zeileis (2008)**. *Conditional variable importance for random forests*. BMC Bioinformatics 9:307 -- pourquoi l'importance individuelle est trompeuse quand les variables sont corrélées.
+-   **Fisher, Rudin & Dominici (2019)**. *All models are wrong, but many are useful: learning a variable's importance by studying an entire class of prediction models simultaneously*. JMLR 20(177) -- formalisation de l'importance par permutation (« model reliance »).
+-   Exemple en protéomique du Parkinson : *Frontiers in Aging Neuroscience* (2026), doi 10.3389/fnagi.2026.1730550, qui compare SVM, régression pénalisée et réseau de neurones sur des données UK Biobank/PPMI.
+
+# Avantages et limites du SVM
+
+::: {.callout-tip title="✅ Ce que le SVM apporte"}
+- **Fonction lisse** : contrairement aux méthodes d'arbres (forêt, XGBoost), pas de marches d'escalier artificielles sur des variables continues -- une frontière/surface qui varie en douceur, souvent plus réaliste pour des concentrations plasmatiques.
+- **Performant à petit n, p modeste** : c'est le régime où le SVM à noyau gaussien se comporte le mieux, souvent mieux que des méthodes d'arbres -- exactement le cas d'une cohorte clinique de quelques dizaines à centaines de patients avec un panel restreint.
+- **Peu sensible aux points éloignés de la frontière** : seuls les vecteurs de support déterminent le modèle ; les autres individus pourraient disparaître sans le changer.
+- **AUC fiable** même quand les probabilités brutes sont mal calibrées (l'AUC ne dépend que de l'ordre des scores, pas de la mise à l'échelle de Platt).
+:::
+
+::: {.callout-warning title="⚠️ Ce que le SVM ne fait pas"}
+- **Aucune valeur manquante tolérée** : `{e1071}` s'arrête net -- imputer ou retirer les lignes avant `fit_svm_repeated_cv()` (contrairement à XGBoost, qui les gère nativement).
+- **Boîte noire, sans sélection de variables** : comme la forêt, aucune variable n'est jamais écartée à zéro -- l'interprétation passe entièrement par l'importance de permutation, `plot_effects_svm()` ou SHAP.
+- **Prédicteurs corrélés** : chacun peut « remplacer » l'autre dans le calcul de similarité -- préférer l'importance de **groupe** (`group_importance_svm()`) à l'importance individuelle dans ce cas.
+- **Réglage (C, gamma) bruité à très petit n** : à vérifier systématiquement avec `check_hyperparam_stability_svm()` avant de faire confiance au modèle final.
+- **Probabilités moins bien calibrées** qu'une régression logistique (mise à l'échelle de Platt, cf. Fondations) -- toujours vérifier `plot_calibration_svm()` avant d'interpréter une probabilité individuelle.
+:::
+
+# Partie A : Régression -- progression du diabète
+
+```{r diab-load}
+library(lars)
+data(diabetes, package = "lars")
+
+diabetes_data <- as.data.frame(unclass(diabetes$x2))
+colnames(diabetes_data) <- make.names(colnames(diabetes_data), unique = TRUE)
+diabetes_data <- diabetes_data %>%
+  dplyr::mutate(y = diabetes$y, PatientID = as.character(dplyr::row_number()))
+
+dim(diabetes_data)
+```
+
+```{r diab-labels}
+# Dictionnaire de labels identique à celui des tutoriels Lasso et RF.
+labels_diabetes_base <- c(
+  age = "Âge", sex = "Sexe", bmi = "IMC", map = "Pression artérielle",
+  tc  = "Cholestérol total", ldl = "LDL", hdl = "HDL", tch = "Cholestérol/HDL",
+  ltg = "Triglycérides (log)", glu = "Glycémie"
+)
+
+labels_diabetes <- setNames(
+  vapply(colnames(diabetes_data), function(col) {
+    if (col %in% names(labels_diabetes_base)) return(labels_diabetes_base[[col]])
+    parts <- strsplit(col, "\\.")[[1]]
+    if (length(parts) == 2 && parts[2] == "2" && parts[1] %in% names(labels_diabetes_base)) {
+      return(paste0(labels_diabetes_base[[parts[1]]], "\u00b2"))
+    }
+    if (length(parts) == 2 && all(parts %in% names(labels_diabetes_base))) {
+      return(paste0(labels_diabetes_base[[parts[1]]], " \u00d7 ", labels_diabetes_base[[parts[2]]]))
+    }
+    col
+  }, character(1)),
+  colnames(diabetes_data)
+)
+```
+
+## Ajustement
+
+::: {.callout-tip title="📘 Comment ça marche"}
+`fit_svm_repeated_cv(data, formula, id_col, v, repeats, seed)` a la même signature d'usage que les autres toolkits. Arguments propres à SVM : `kernel` (`"radial"` par défaut, ou `"linear"`), `cost_grid` et `gamma_grid` (grilles de réglage ; par défaut C ∈ {0,25 ; 1 ; 4 ; 16} et gamma ∈ {0,1 ; 0,3 ; 1 ; 3} / p), `epsilon` (régression), `inner_v` (folds de la CV interne, 5 par défaut) et `n_perm` (permutations par variable, 20 par défaut). `perm_groups` (facultatif) permute un groupe de variables **d'un bloc** pour mesurer ce qu'elles apportent ensemble -- ici les 4 variables de cholestérol, fortement corrélées entre elles. La formule n'a pas besoin de `- 1`.
+:::
+
+```{r diab-fit}
+fit_svm_diab <- fit_svm_repeated_cv(
+  data    = diabetes_data,
+  formula = y ~ .,
+  id_col  = "PatientID",
+  v = 5, repeats = 20, seed = 42,
+  perm_groups = list(Cholesterol = c("tc", "ldl", "hdl", "tch")),
+  parallelisation = TRUE
+)
+
+print(fit_svm_diab)
+```
+
+::: {.callout-note title="⏱️ Temps de calcul"}
+Chaque fold règle ses hyperparamètres par CV interne avant d'être ajusté : compter plusieurs minutes pour 100 folds sur ce jeu (n = 442, p = 64) ; `parallelisation = TRUE` répartit les folds sur plusieurs coeurs sans changer le résultat. Pour un essai rapide : `repeats = 3`.
+:::
+
+## Réglage des hyperparamètres
+
+Chaque fold choisit son couple (C, gamma) par CV interne. Trois questions : la **grille est-elle bien centrée** (valeur retenue rarement au bord) ? Le **choix est-il stable** d'un fold à l'autre ? Le modèle **mémorise-t-il** ses données (part de vecteurs de support proche de 100 %) ?
+
+```{r diab-hyper}
+#| fig-width: 10
+#| fig-height: 5
+
+print(check_hyperparam_stability_svm(fit_svm_diab))
+plot_hyperparam_path_svm(fit_svm_diab)
+plot_hyperparam_stability_svm(fit_svm_diab)
+```
+
+## Performance
+
+```{r diab-perf}
+perf_svm_diab <- model_performance.svm_cv_fit(fit_svm_diab)
+print(perf_svm_diab)
+```
+
+```{r diab-pred-quality}
+#| fig-width: 9
+#| fig-height: 9
+
+plot_prediction_quality_svm(fit_svm_diab, mode = "panel")
+```
+
+Seules les prédictions des **folds de test** (`fold_predictions`) sont honnêtes ; le mode `"final"` montre le modèle final sur ses propres données d'entraînement, optimiste par construction.
+
+## Quelles variables comptent ? Importance par permutation
+
+::: {.callout-note title="📘 Comment lire ces sorties"}
+**L'importance est calculée sur le fold de test** (patients jamais vus par l'entraînement ni par le réglage) : c'est une importance honnête, qui ne récompense pas les variables servant seulement à sur-apprendre. Chaque valeur individuelle est bruitée (un fold de test ne contient qu'environ n/5 patients) ; c'est la **moyenne sur les 100 folds** qui est informative. L'unité est celle de la réponse (dégradation du RMSE) ou du score de Brier en classification.
+
+Trois lectures complémentaires :
+
+-   `check_importance_svm()` : importance moyenne et **stabilité du rang** (`rank_sd` faible = la variable est classée de façon cohérente d'un fold à l'autre) ;
+-   `plot_variable_importance_svm()` : fréquence dans le top-K et amplitude de l'importance à travers les folds ;
+-   `group_importance_svm()` : importance de **groupes** de variables permutés d'un bloc. Quand des variables sont corrélées (ici le cholestérol), chacune peut « remplacer » l'autre : leurs importances individuelles sont **diluées**, alors que celle du groupe ne l'est pas.
+:::
+
+```{r diab-importance}
+#| fig-width: 8
+#| fig-height: 9
+
+imp_svm_diab <- check_importance_svm(fit_svm_diab, top_n = 20)
+print(imp_svm_diab)
+plot_importance_svm(imp_svm_diab, labels = labels_diabetes, fit = fit_svm_diab)
+```
+
+```{r diab-var-importance}
+#| fig-width: 10
+#| fig-height: 8
+
+plot_variable_importance_svm(fit_svm_diab, labels = labels_diabetes, top_k = 10, top_n = 20)
+```
+
+```{r diab-group-importance}
+group_importance_svm(fit_svm_diab)
+```
+
+```{r diab-imp-table}
+export_table(importance_table_svm(fit_svm_diab), caption = "Importance des variables (diabète, SVM)")
+```
+
+## Comment agissent-elles ? Forme des effets et SHAP
+
+```{r diab-effects}
+#| fig-width: 12
+#| fig-height: 7
+
+plot_effects_svm(fit_svm_diab, top_n = 6, labels = labels_diabetes)
+```
+
+::: {.callout-tip title="📘 Dépendance partielle et SHAP : deux façons de lire un effet"}
+La **dépendance partielle** trace la prédiction moyenne du modèle quand une variable varie (les autres gardant leurs valeurs) : sens et forme de l'effet **en moyenne**. Les **valeurs de Shapley** (`check_shap()`) attribuent, pour **chaque patient**, la part de sa prédiction due à chaque variable : elles montrent aussi l'hétérogénéité (une variable qui aide certains patients et pas d'autres). `check_shap()` utilise le **même algorithme Monte Carlo** pour toutes les méthodes du toolkit, donc les valeurs sont **comparables d'une méthode à l'autre**.
+:::
+
+```{r diab-shap}
+#| fig-width: 10
+#| fig-height: 8
+
+shap_svm_diab <- check_shap(fit_svm_diab, method = "svm", nsim = 30, sample_size = 150)
+plot_shap(shap_svm_diab, labels = labels_diabetes, top_n = 15, type = "beeswarm")
+```
+
+## Diagnostics de résidus (descriptifs)
+
+```{r diab-diagnostics}
+#| fig-width: 8
+#| fig-height: 6
+
+plot(check_independence_svm(fit_svm_diab))
+plot(check_normality_svm(fit_svm_diab))
+plot(check_heteroscedasticity_svm(fit_svm_diab))
+plot(check_outliers_svm(fit_svm_diab))
+```
+
+Comme pour la forêt et MARS, ces diagnostics sont **descriptifs** : le modèle est jugé sur sa performance de prédiction en CV, pas sur des hypothèses de normalité des résidus.
+
+## Vue d'ensemble : `check_model_svm()`
+
+```{r diab-check-model}
+#| fig-width: 13
+#| fig-height: 15
+
+check_model_svm(fit_svm_diab, labels = labels_diabetes)
+```
+
+# Partie B : Classification -- diagnostic de la maladie d'Alzheimer
+
+```{r alz-load}
+library(AppliedPredictiveModeling)
+data(AlzheimerDisease)
+
+alzheimer_data <- predictors %>%
+  dplyr::mutate(diagnosis = diagnosis, PatientID = as.character(dplyr::row_number()))
+
+dim(alzheimer_data)
+table(alzheimer_data$diagnosis)
+```
+
+## Ajustement : `family = "binomial"`
+
+En classification, la réponse peut être un facteur à 2 niveaux : le second niveau est la classe « positive ». Les probabilités proviennent de la mise à l'échelle de Platt (cf. Fondations) : l'**AUC** est fiable, les **probabilités brutes** sont à vérifier avec la courbe de calibration.
+
+```{r alz-fit}
+fit_svm_alz <- fit_svm_repeated_cv(
+  data    = alzheimer_data,
+  formula = diagnosis ~ .,
+  id_col  = "PatientID",
+  family  = "binomial",
+  v = 5, repeats = 20, seed = 42,
+  parallelisation = TRUE
+)
+
+print(fit_svm_alz)
+```
+
+```{r alz-hyper}
+#| fig-width: 10
+#| fig-height: 5
+
+print(check_hyperparam_stability_svm(fit_svm_alz))
+plot_hyperparam_path_svm(fit_svm_alz)
+```
+
+## Performance : Accuracy, AUC, Brier
+
+```{r alz-perf}
+print(model_performance.svm_cv_fit(fit_svm_alz))
+```
+
+```{r alz-roc-pr-calib-confusion}
+#| fig-width: 7
+#| fig-height: 6
+
+plot_roc_svm(fit_svm_alz)
+plot_precision_recall_svm(fit_svm_alz)
+plot_calibration_svm(fit_svm_alz)
+plot_confusion_matrix_svm(fit_svm_alz)
+```
+
+La **courbe de calibration** compare la probabilité prédite à la fréquence observée : suivre la diagonale = probabilités interprétables. Avec un SVM, un écart est fréquent ; il n'invalide pas l'AUC, mais impose de ne pas lire les probabilités brutes comme des risques.
+
+## Importance des biomarqueurs et forme des effets
+
+```{r alz-importance}
+#| fig-width: 9
+#| fig-height: 12
+
+imp_svm_alz <- check_importance_svm(fit_svm_alz, top_n = 25)
+print(imp_svm_alz)
+plot_importance_svm(imp_svm_alz)
+```
+
+```{r alz-effects}
+#| fig-width: 12
+#| fig-height: 7
+
+plot_effects_svm(fit_svm_alz, top_n = 6)
+```
+
+En classification, l'axe vertical de `plot_effects_svm()` est la **probabilité prédite** : on lit directement comment le risque évolue avec le biomarqueur.
+
+```{r alz-shap}
+#| fig-width: 10
+#| fig-height: 8
+
+shap_svm_alz <- check_shap(fit_svm_alz, method = "svm", nsim = 30, sample_size = 120)
+plot_shap(shap_svm_alz, top_n = 15, type = "bar")
+```
+
+## Vue d'ensemble
+
+```{r alz-check-model}
+#| fig-width: 13
+#| fig-height: 15
+
+check_model_svm(fit_svm_alz)
+```
+
+# Lire les visualisations d'ensemble
+
+::: {.callout-note collapse="true" title="📘 Détail des graphiques combinés (cliquer pour déplier)"}
+**`check_model_svm(fit)`** -- le grand panel combiné (4 à 6 vignettes selon `family`) :
+
+- *Régression* : qualité de prédiction (mode `"panel"`) · résidus vs valeurs prédites · Q-Q plot des résidus (descriptif) · Scale-Location (homoscédasticité, descriptif -- un modèle régularisé comme le SVM tire ses prédictions vers le centre, ce qui peut élargir le résidu aux extrêmes de Y sans que ce soit un défaut de spécification).
+- *Classification* : qualité de prédiction · courbe ROC · courbe de calibration (à examiner particulièrement, cf. Fondations) · matrice de confusion.
+- Dernière vignette : stabilité de l'importance par permutation à travers les folds (`check_importance_svm()`).
+
+**`plot_prediction_quality_svm(fit, mode = ...)`** -- mêmes 5 modes que le Lasso (`"pooled"`, `"pooled_mean"`, `"final"`, `"overlay"`, `"panel"`) : voir le détail dans `tutoriel_lasso_performance_toolkit.qmd`. Le mode `"final"` reste optimiste (le modèle final est réévalué sur ses propres données d'entraînement).
+
+**`plot_variable_importance_svm(fit)`** / **`check_importance_svm(fit)`** -- fréquence dans le top-K et amplitude de l'importance par permutation à travers les folds, même lecture que côté forêt (`rank_sd` faible = classement stable).
+
+**`group_importance_svm(fit)`** -- une ligne par groupe défini dans `perm_groups` : `mean_importance` (positif = le groupe aide), `pct_folds_positive` (proche de 100% = effet consistant), `[q025 ; q975]` (dispersion entre folds -- PAS un intervalle de confiance sur de nouveaux patients).
+
+**Courbes ROC / calibration / matrice de confusion** : calculées sur les prédictions **poolées** de la CV (honnêtes) ; `plot_calibration_svm()` est la vignette à examiner en premier pour ce modèle (cf. Fondations, mise à l'échelle de Platt).
+:::
+
+# Et ensuite ?
+
+Comparer cette méthode aux autres **sur les mêmes folds** : `tutoriel_model_comparison_toolkit.qmd` (`compare_methods()`, `compare_importance()`, `compare_variable_selection()`, `compare_shap()`). Pour évaluer si un groupe de biomarqueurs **ajoute** de la prédiction à des variables cliniques, ajuster la même méthode avec deux formules sur les mêmes folds et les passer à `compare_methods()` (cf. `projet_pd_prediction_template.qmd`).
+
+# Références
+
+Cf. la section « Pour aller plus loin » des Fondations (en tête de ce document) pour la liste complète des références théoriques (Cortes & Vapnik 1995, Boser, Guyon & Vapnik 1992, Chang & Lin 2011, Platt 1999...). Références propres à l'interprétation et à la comparaison :
+
+- Fisher, A., Rudin, C., & Dominici, F. (2019). *All models are wrong, but many are useful: learning a variable's importance by studying an entire class of prediction models simultaneously.* Journal of Machine Learning Research, 20(177), 1–81. -- fondement de l'importance par permutation utilisée ici.
+- Strobl, C., Boulesteix, A.-L., Kneib, T., Augustin, T., & Zeileis, A. (2008). *Conditional variable importance for random forests.* BMC Bioinformatics, 9, 307. -- pourquoi l'importance individuelle est trompeuse quand les variables sont corrélées, et l'intérêt de l'importance de groupe.
+- Štrumbelj, E., & Kononenko, I. (2014). *Explaining prediction models and individual predictions with feature contributions.* Knowledge and Information Systems, 41(3), 647–665. -- algorithme SHAP Monte Carlo utilisé par `check_shap()`.
+- Voir aussi `tutoriel_lasso_performance_toolkit.qmd`, `tutoriel_rf_performance_toolkit.qmd`, `tutoriel_mars_performance_toolkit.qmd`, `tutoriel_xgb_performance_toolkit.qmd` et `tutoriel_model_comparison_toolkit.qmd` pour les autres méthodes de la série.

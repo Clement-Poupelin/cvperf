@@ -1,0 +1,817 @@
+---
+title: "Forêt aléatoire en validation croisée répétée"
+author: "Clément Poupelin"
+date: 09-18-2026
+date-modified: "`r Sys.Date()`"
+format: 
+  html:
+    embed-resources: false
+    toc: true
+    code-fold: true
+    code-summary: "Show the code"
+    code-tools: true
+    toc-location: right
+    page-layout: article
+    code-overflow: wrap
+number-sections: false
+editor: visual
+categories: ["Machine Learning", "Random Forest", "Non-Linear Models"]
+description: "Guide pratique du toolkit `rf_performance_toolkit.R`"
+execute: 
+  echo: true 
+  warning: false 
+  message: false
+  error: true
+---
+
+<!--
+=================================================================================
+tutoriel_rf_performance_toolkit.qmd
+=================================================================================
+Document AUTONOME, contrepartie non-linéaire de
+tutoriel_lasso_performance_toolkit.qmd. 2 exemples, repris EXACTEMENT des
+sections A.1 et B.1 du tutoriel Lasso (même jeu de données, même id_col,
+mêmes seed/v/repeats) pour que les 2 documents restent directement
+comparables et puissent nourrir tutoriel_model_comparison_toolkit.qmd :
+
+  A. Gaussienne,  p < n (p=64,  n=442) -- lars::diabetes (progression du diabète)
+  B. Binomiale,   p < n (p≈130, n=333) -- AppliedPredictiveModeling::AlzheimerDisease
+
+CHOIX DE PORTÉE : contrairement au tutoriel Lasso (4 exemples, dont 2 en
+régime p >> n), ce document se limite au régime p < n. Une forêt aléatoire
+n'a en réalité AUCUNE difficulté théorique en p >> n (mtry reste défini,
+aucune condition de rang plein n'est requise) -- ce choix est seulement une
+question de portée de ce tutoriel, pas une limite du toolkit. Les 2 exemples
+p >> n du tutoriel Lasso (Khan, gaussien et binomial) sont de bons candidats
+pour une extension future de ce document.
+
+PRÉREQUIS
+---------
+install.packages(c("ISLR2", "AppliedPredictiveModeling", "lars", "ranger",
+                    "rsample", "dplyr", "tidyr", "purrr", "tibble",
+                    "ggplot2", "patchwork", "ggrepel", "nortest",
+                    "fastshap", "knitr", "viridis", "DT"))
+
+Le fichier rf_performance_toolkit.R doit se trouver dans le même dossier que
+ce document (installer le package : devtools::install("cvperf")). shap_toolkit.R est
+également requis (section SHAP, Partie A).
+
+AVERTISSEMENT DE TEMPS DE CALCUL
+----------------------------------
+Chaque fold de fit_rf_repeated_cv() ajuste PLUSIEURS forêts (une par valeur
+de mtry testée, pour la sélection par erreur OOB) avant de retenir la
+meilleure -- plus lent qu'un fold de cv.glmnet() côté Lasso, mais reste de
+l'ordre de la minute sur les 2 exemples de ce document (p < 130, 5 x 20 = 100
+folds).
+=================================================================================
+-->
+
+```{r setup}
+#| include: false
+
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(tibble)
+library(ggplot2)
+library(patchwork)
+library(ranger)
+library(rsample)
+library(ggrepel)
+library(nortest)
+library(viridis)
+library(knitr)
+library(DT)
+
+library(cvperf)
+```
+
+```{r export-table-helper}
+#| include: false
+
+export_table <- function(df, caption = NULL, page_length = 10) {
+  DT::datatable(
+    df, caption = caption, rownames = FALSE, filter = "top",
+    extensions = "Buttons",
+    options = list(dom = "Bfrtip", buttons = c("csv", "excel"),
+                   pageLength = page_length, scrollX = TRUE)
+  )
+}
+```
+
+# Pourquoi ce tutoriel
+
+Ce document est la contrepartie NON-LINÉAIRE de [`tutoriel_lasso_performance_toolkit.qmd`](tutoriel_lasso_performance_toolkit.qmd) : mêmes jeux de données, même protocole de validation croisée répétée, mais un modèle à base d'arbres (forêt aléatoire, package [{ranger}](https://cran.r-project.org/package=ranger)) plutôt qu'une régression linéaire pénalisée. L'objectif n'est pas de "remplacer" le Lasso, mais de disposer d'un point de comparaison non-linéaire ajusté avec la même rigueur méthodologique (folds partagés, diagnostics équivalents) -- la comparaison proprement dite fait l'objet d'un 3ᵉ document, [`tutoriel_model_comparison_toolkit.qmd`](tutoriel_model_comparison_toolkit.qmd).
+
+::: {.callout-important title="📘 Ce qui change vraiment par rapport au Lasso"}
+Le fichier `rf_performance_toolkit.R` documente en tête chaque changement d'interprétation en détail ; en résumé :
+
+| Question posée | Lasso | Forêt aléatoire |
+|---|---|---|
+| Les prédicteurs sont-ils trop corrélés pour être estimés ? | VIF (`check_collinearity_lasso`) | Sans objet (`check_importance_rf` : l'importance est-elle **stable** ?) |
+| Comment choisir la complexité du modèle ? | `lambda` (CV interne de `cv.glmnet`) | `mtry` (erreur **OOB**, sous-produit gratuit du bagging) |
+| Quel est l'effet d'une variable ? | Coefficient signé (effet partiel) | Importance par permutation (pas de signe -- effet potentiellement non-monotone) |
+| Les résidus doivent-ils être gaussiens/homoscédastiques ? | Oui, hypothèses du modèle `lm` sous-jacent | Non -- diagnostics conservés à titre **descriptif** uniquement |
+:::
+
+# Fondations : comprendre la forêt aléatoire de zéro
+
+## L'idée en une phrase
+
+> **Une forêt aléatoire moyenne les prédictions de centaines d'arbres de décision, chacun sciemment rendu un peu différent des autres (par tirage aléatoire des individus ET des variables) -- individuellement médiocres, mais collectivement plus stables que n'importe lequel d'entre eux pris seul.**
+
+## Rappel : un arbre de décision
+
+Un arbre de décision prédit en posant une suite de questions ("`AGE < 65 ?`", puis "`PROTEINE_X < 4.2 ?`"...), chaque réponse menant à une nouvelle question, jusqu'à une feuille qui donne la prédiction (la moyenne des individus d'entraînement tombés dans cette feuille). Un arbre profond épouse parfaitement ses données d'entraînement -- et donc aussi leur bruit : c'est un modèle à **faible biais, forte variance** (deux tirages d'entraînement différents donnent 2 arbres très différents).
+
+## Bagging : moyenner pour réduire la variance
+
+L'idée du *bagging* (**b**ootstrap **agg**regat**ing**, Breiman 1996) : si un arbre unique est instable, faire pousser beaucoup d'arbres sur des tirages **bootstrap** différents des mêmes données (tirage avec remise, même taille que l'échantillon d'origine), puis **moyenner** leurs prédictions. Chaque arbre reste bruité, mais les erreurs des arbres se moyennent partiellement -- comme la moyenne de plusieurs mesures est plus stable qu'une mesure unique.
+
+```{r}
+#| label: fig-rf-bagging
+#| fig-width: 10
+#| fig-height: 3.6
+#| fig-cap: "Un arbre unique (gauche) colle aux données en marches d\'escalier bruitées. Une forêt de 300 arbres (droite) moyenne ces marches en une courbe plus lisse et plus stable -- sans jamais devenir une droite : la forêt reste une fonction constante par morceaux, mais avec beaucoup plus de morceaux, plus fins."
+
+set.seed(9)
+n_rf <- 130
+x_rf <- sort(runif(n_rf, 0, 10))
+y_rf_true <- ifelse(x_rf < 3, 1, ifelse(x_rf < 7, 1 + 1.4 * (x_rf - 3), 1 + 1.4 * 4))
+df_rf <- tibble::tibble(x = x_rf, y = y_rf_true + rnorm(n_rf, 0, 0.6))
+grille_rf <- tibble::tibble(x = seq(0, 10, length.out = 400))
+
+arbre1 <- ranger::ranger(y ~ x, data = df_rf, num.trees = 1, min.node.size = 5)
+foret  <- ranger::ranger(y ~ x, data = df_rf, num.trees = 300)
+grille_rf$un_arbre <- predict(arbre1, data = grille_rf)$predictions
+grille_rf$foret    <- predict(foret,  data = grille_rf)$predictions
+
+p_arbre <- ggplot(df_rf, aes(x, y)) +
+  geom_point(alpha = 0.3, size = 0.9) +
+  geom_line(data = grille_rf, aes(x, un_arbre), colour = "#B2182B", linewidth = 0.9) +
+  labs(title = "1 seul arbre", subtitle = "Marches d'escalier bruitées, colle au bruit") +
+  theme_minimal(base_size = 11) + theme(plot.subtitle = element_text(size = 8.5, colour = "grey40"))
+
+p_foret <- ggplot(df_rf, aes(x, y)) +
+  geom_point(alpha = 0.3, size = 0.9) +
+  geom_line(data = grille_rf, aes(x, foret), colour = "#1B9E77", linewidth = 0.9) +
+  labs(title = "Forêt de 300 arbres", subtitle = "Moyenne : marches plus fines, plus stables") +
+  theme_minimal(base_size = 11) + theme(plot.subtitle = element_text(size = 8.5, colour = "grey40"))
+
+p_arbre | p_foret
+```
+
+## Le "aléatoire" en plus du bagging : `mtry`
+
+Le bagging seul ne suffit pas à bien décorréler les arbres : si une variable domine très fortement le signal, presque tous les arbres bootstrap choisiraient le même premier split sur cette même variable, et resteraient donc très corrélés entre eux (moyenner des prédictions corrélées réduit peu la variance). La forêt aléatoire ajoute un second tirage : à **chaque split**, seul un sous-ensemble aléatoire de `mtry` variables (parmi les $p$ candidates) est autorisé à concourir. Cela force les arbres à explorer des chemins différents, et achève de les décorréler. `mtry` est le réglage central de la méthode :
+
+- **`mtry` petit** : arbres très différents les uns des autres (bonne décorrélation), mais chaque split est moins bien choisi (parfois seules des variables faibles sont proposées) -- biais un peu plus grand.
+- **`mtry` grand** (jusqu'à $p$, plus de randomisation des variables) : chaque split est mieux choisi, mais les arbres se ressemblent davantage -- variance un peu plus grande.
+
+`fit_rf_repeated_cv()` choisit `mtry` par validation croisée interne sur l'erreur OOB (paragraphe suivant), une grille par défaut centrée sur $\sqrt{p}$ (classification) ou $p/3$ (régression) -- les repères empiriques de Breiman (2001).
+
+## L'erreur OOB (*out-of-bag*), évaluation "gratuite"
+
+Un tirage bootstrap laisse, en moyenne, environ **37%** des observations de côté (elles ne sont pas tirées) : ces observations *out-of-bag* (OOB) n'ont jamais été vues par cet arbre, et servent donc à l'évaluer -- sans découpage supplémentaire, sans coût de calcul additionnel, puisque chaque arbre a de toute façon SES propres OOB. `fit_rf_repeated_cv()` s'en sert pour choisir `mtry` à l'intérieur de chaque fold d'entraînement, exactement comme `cv.glmnet()` choisit `lambda` par sa propre CV interne.
+
+## Importance par permutation : comment lire un modèle qui n'a pas de coefficient
+
+Une forêt n'a ni coefficient, ni équation à lire. Son importance de variable (`check_importance_rf()`) est calculée par **permutation** : on mélange aléatoirement les valeurs d'une variable et on mesure de combien la prédiction se dégrade -- une dégradation forte signale une variable dont le modèle dépend beaucoup. C'est le même principe que celui repris ensuite par les toolkits SVM et XGBoost de cette série (`cf. tutoriel_svm_performance_toolkit.qmd`, `tutoriel_xgb_performance_toolkit.qmd`), qui l'appliquent en plus sur des données de TEST (plus honnête encore) ; `ranger` la calcule ici sur les données OOB de chaque arbre.
+
+**Références :**
+
+- Breiman, L. (2001). *Random Forests.* Machine Learning, 45(1), 5–32.
+- Breiman, L. (1996). *Bagging Predictors.* Machine Learning, 24(2), 123–140.
+- Breiman, L. (1996). *Out-of-bag estimation.* Technical report, Statistics Department, UC Berkeley.
+- Wright, M. N., & Ziegler, A. (2017). *ranger: A Fast Implementation of Random Forests for High Dimensional Data in C++ and R.* Journal of Statistical Software, 77(1), 1–17.
+
+# Avantages et limites de la forêt aléatoire
+
+::: {.callout-tip title="✅ Ce que la forêt apporte"}
+- **Non linéaire, sans rien spécifier** : capte seuils, paliers et interactions automatiquement, sans les construire à la main (contrairement au Lasso).
+- **Peu de réglages sensibles** : `mtry` est le seul réglage vraiment influent, et sa grille par défaut (autour de $\sqrt{p}$ ou $p/3$) fonctionne bien dans la plupart des cas -- moins de risque de mal régler qu'avec `C`/`gamma` (SVM) ou `max_depth`/`eta`/`nrounds` (XGBoost).
+- **Robuste au sur-apprentissage par le nombre d'arbres** : contrairement au boosting, ajouter des arbres ne dégrade jamais la performance (ils moyennent, ils ne corrigent pas les erreurs les uns des autres) -- `num.trees` n'a donc pas besoin d'être réglé finement.
+- **Évaluation OOB gratuite**, en plus de la CV répétée du toolkit.
+- **Gère nativement les facteurs à plusieurs niveaux et les interactions**, sans encodage préalable ni terme d'interaction à spécifier.
+:::
+
+::: {.callout-warning title="⚠️ Ce que la forêt ne fait pas"}
+- **Boîte noire** : aucune équation, aucun coefficient -- l'interprétation passe entièrement par l'importance de permutation, la dépendance partielle ou SHAP (`check_shap(method = "rf")`).
+- **N'écarte jamais une variable** : contrairement au Lasso ou à MARS, une variable inutile reçoit une importance proche de 0 mais reste dans le modèle -- il n'y a pas de "liste de variables retenues" native (`plot_variable_importance_rf(top_k=...)` en tient lieu, avec un seuil arbitraire).
+- **Fonction en marches d'escalier** : même moyennée sur des centaines d'arbres, la prédiction n'est jamais parfaitement lisse (contrairement à MARS ou au SVM à noyau gaussien) -- rarement visible en pratique, mais réel.
+- **Coefficients absents** : aucune lecture directe du sens/de l'amplitude d'un effet sans passer par `plot_effects_rf()`/SHAP -- plus de travail d'interprétation qu'un Lasso.
+- **Plus lente qu'un Lasso** à nombre de folds égal (cf. `computational_info` de chaque fit) -- reste nettement plus rapide que SVM/XGBoost sur un panel de taille modeste.
+:::
+
+## Vue d'ensemble des 2 exemples
+
+| Exemple | Famille | Jeu de données | n | p | Équivalent Lasso |
+|---|---|---|---|---|---|
+| A | Gaussienne | `diabetes` (progression du diabète) | 442 | 64 | Section A.1 |
+| B | Logistique | `AlzheimerDisease` | 333 | ≈130 | Section B.1 |
+
+---
+
+# Deux processus indépendants : boucle de CV et modèle final
+
+Cette section est valable pour les 2 exemples de ce document (et pour `tutoriel_lasso_performance_toolkit.qmd`) : à chaque fois qu'un `fit_rf_repeated_cv()` est ajusté, il produit à la fois les 100 forêts de la boucle de CV et un modèle final distinct, selon le schéma ci-dessous.
+
+```{=html}
+<svg width="100%" viewBox="0 0 680 560" role="img" xmlns="http://www.w3.org/2000/svg" style="max-width:680px;display:block;margin:0 auto;">
+<title>Boucle de validation croisée versus construction du modèle final</title>
+<desc>Deux processus indépendants partant des mêmes données : à gauche, 100 modèles de CV entraînés chacun sur environ 80% des données pour estimer la performance ; à droite, un seul modèle final entraîné sur 100% des données. Les deux résultats se combinent ensuite dans le plot en mode pooled.</desc>
+<defs>
+  <marker id="cvArrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+    <path d="M2 1L8 5L2 9" fill="none" stroke="#888888" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  </marker>
+</defs>
+
+<text x="40" y="50" style="font:500 14px sans-serif; fill:#1a1a1a;">Boucle de CV (validation)</text>
+<text x="350" y="50" style="font:500 14px sans-serif; fill:#1a1a1a;">Modèle final (déploiement)</text>
+
+<g>
+  <rect x="40" y="64" width="290" height="56" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+  <text x="185" y="84" text-anchor="middle" style="font:500 14px sans-serif; fill:#085041;">Données complètes</text>
+  <text x="185" y="104" text-anchor="middle" style="font:400 12px sans-serif; fill:#0F6E56;">100% des individus (n)</text>
+</g>
+<line x1="185" y1="120" x2="185" y2="148" stroke="#888888" stroke-width="1.5" marker-end="url(#cvArrow)"/>
+
+<g>
+  <rect x="40" y="148" width="290" height="56" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+  <text x="185" y="168" text-anchor="middle" style="font:500 14px sans-serif; fill:#085041;">100 découpages aléatoires</text>
+  <text x="185" y="188" text-anchor="middle" style="font:400 12px sans-serif; fill:#0F6E56;">5 folds × 20 répétitions</text>
+</g>
+<line x1="185" y1="204" x2="185" y2="232" stroke="#888888" stroke-width="1.5" marker-end="url(#cvArrow)"/>
+
+<g>
+  <rect x="40" y="232" width="290" height="56" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+  <text x="185" y="252" text-anchor="middle" style="font:500 14px sans-serif; fill:#085041;">100 modèles distincts</text>
+  <text x="185" y="272" text-anchor="middle" style="font:400 12px sans-serif; fill:#0F6E56;">chacun entraîné sur ~80%</text>
+</g>
+<line x1="185" y1="288" x2="185" y2="316" stroke="#888888" stroke-width="1.5" marker-end="url(#cvArrow)"/>
+
+<g>
+  <rect x="40" y="316" width="290" height="56" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+  <text x="185" y="336" text-anchor="middle" style="font:500 14px sans-serif; fill:#085041;">Prédictions sur le 20% test</text>
+  <text x="185" y="356" text-anchor="middle" style="font:400 12px sans-serif; fill:#0F6E56;">jamais vu par CE modèle</text>
+</g>
+
+<g>
+  <rect x="350" y="64" width="290" height="56" rx="8" fill="#FAECE7" stroke="#993C1D" stroke-width="0.5"/>
+  <text x="495" y="84" text-anchor="middle" style="font:500 14px sans-serif; fill:#712B13;">Données complètes</text>
+  <text x="495" y="104" text-anchor="middle" style="font:400 12px sans-serif; fill:#993C1D;">100% des individus (n)</text>
+</g>
+<line x1="495" y1="120" x2="495" y2="148" stroke="#888888" stroke-width="1.5" marker-end="url(#cvArrow)"/>
+
+<g>
+  <rect x="350" y="148" width="290" height="56" rx="8" fill="#FAECE7" stroke="#993C1D" stroke-width="0.5"/>
+  <text x="495" y="168" text-anchor="middle" style="font:500 14px sans-serif; fill:#712B13;">Tuning interne propre</text>
+  <text x="495" y="188" text-anchor="middle" style="font:400 12px sans-serif; fill:#993C1D;">cv.glmnet (λ) / OOB (mtry)</text>
+</g>
+<line x1="495" y1="204" x2="495" y2="232" stroke="#888888" stroke-width="1.5" marker-end="url(#cvArrow)"/>
+
+<g>
+  <rect x="350" y="232" width="290" height="56" rx="8" fill="#FAECE7" stroke="#993C1D" stroke-width="0.5"/>
+  <text x="495" y="252" text-anchor="middle" style="font:500 14px sans-serif; fill:#712B13;">1 seul modèle</text>
+  <text x="495" y="272" text-anchor="middle" style="font:400 12px sans-serif; fill:#993C1D;">entraîné sur les 100%</text>
+</g>
+
+<line x1="185" y1="372" x2="185" y2="430" stroke="#888888" stroke-width="1.5" marker-end="url(#cvArrow)"/>
+<line x1="495" y1="288" x2="495" y2="430" stroke="#888888" stroke-width="1.5" marker-end="url(#cvArrow)"/>
+
+<g>
+  <rect x="90" y="430" width="500" height="80" rx="8" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.5"/>
+  <text x="340" y="452" text-anchor="middle" style="font:500 14px sans-serif; fill:#3C3489;">Plot mode "pooled"</text>
+  <text x="340" y="474" text-anchor="middle" style="font:400 12px sans-serif; fill:#534AB7;">Trait bleu = étendue (gauche, 100 modèles)</text>
+  <text x="340" y="496" text-anchor="middle" style="font:400 12px sans-serif; fill:#534AB7;">Point orange = modèle final (droite, 1 modèle)</text>
+</g>
+</svg>
+```
+
+::: {.callout-note title="🎯 Pourquoi garder la CV si elle ne construit pas le modèle final ?"}
+Comme côté Lasso, `fit_rf_diab$final_model` n'est PAS un résumé des 100 forêts de la CV -- c'est une forêt neuve, entraînée sur 100% des données, avec son propre réglage de `mtry` par erreur OOB (cf. `.tune_mtry_oob()`). La CV répétée ne sert donc pas à construire ce modèle final, mais à estimer honnêtement la performance de *la même recette* (même formule, même façon de choisir `mtry`) avant d'appliquer cette recette une dernière fois sur toutes les données. Sans elle, le seul chiffre disponible serait le score d'entraînement du modèle final -- optimiste par construction, cf. mode `"final"` ci-dessus. Détail complet et analogie dans `tutoriel_lasso_performance_toolkit.qmd`, section A.1.
+:::
+
+::: {.callout-tip title="🎯 En pratique : utiliser et interpréter le modèle final"}
+- **Prédire un nouveau patient** : `predict(fit_rf_diab$final_model, data = nouveau_patient)` -- aucun biais, ce patient n'a jamais participé à l'entraînement.
+- **Rapporter une performance** : toujours `model_performance.rf_cv_fit()$pooled` (CV poolée), jamais le R² d'entraînement du mode `"final"`.
+- **Interpréter l'importance des variables** : celle du modèle final (`importance_table_rf()`) pour la version officielle ; celle de `check_importance_rf()` (100 forêts) pour juger de sa stabilité.
+- **Extrapolation** : rester prudent pour un nouveau patient dont les caractéristiques sortent de la plage observée dans les données d'entraînement.
+
+Détail complet dans `tutoriel_lasso_performance_toolkit.qmd`, section A.1.
+:::
+
+---
+
+# Partie A : Régression -- progression du diabète
+
+::: {.callout-tip title="📚 Origine des données"}
+Identique à la section A.1 du tutoriel Lasso -- cf. Efron, Hastie, Johnstone, & Tibshirani (2004), *Least Angle Regression*, Annals of Statistics, 32(2), 407–499 ; package `{lars}`.
+:::
+
+```{r diab-load}
+library(lars)
+data(diabetes, package = "lars")
+
+diabetes_data <- as.data.frame(unclass(diabetes$x2))
+colnames(diabetes_data) <- make.names(colnames(diabetes_data), unique = TRUE)
+diabetes_data <- diabetes_data %>%
+  dplyr::mutate(y = diabetes$y, PatientID = as.character(dplyr::row_number()))
+
+dim(diabetes_data)
+```
+
+```{r diab-labels}
+# Dictionnaire de labels identique à celui de tutoriel_lasso_performance_toolkit.qmd
+# (généré automatiquement à partir des 10 variables de base -- cf. ce fichier
+# pour le détail des règles de construction des termes quadratiques/interactions).
+labels_diabetes_base <- c(
+  age = "Âge", sex = "Sexe", bmi = "IMC", map = "Pression artérielle",
+  tc  = "Cholestérol total", ldl = "LDL", hdl = "HDL", tch = "Cholestérol/HDL",
+  ltg = "Triglycérides (log)", glu = "Glycémie"
+)
+
+labels_diabetes <- setNames(
+  vapply(colnames(diabetes_data), function(col) {
+    if (col %in% names(labels_diabetes_base)) return(labels_diabetes_base[[col]])
+    parts <- strsplit(col, "\\.")[[1]]
+    if (length(parts) == 2 && parts[2] == "2" && parts[1] %in% names(labels_diabetes_base)) {
+      return(paste0(labels_diabetes_base[[parts[1]]], "\u00b2"))
+    }
+    if (length(parts) == 2 && all(parts %in% names(labels_diabetes_base))) {
+      return(paste0(labels_diabetes_base[[parts[1]]], " \u00d7 ", labels_diabetes_base[[parts[2]]]))
+    }
+    col
+  }, character(1)),
+  colnames(diabetes_data)
+)
+```
+
+## Ajustement
+
+::: {.callout-tip title="📘 Comment ça marche"}
+`fit_rf_repeated_cv(data, formula, id_col, v, repeats, seed)` a la MÊME signature d'usage que `fit_lasso_repeated_cv()` -- seule différence notable : la formule n'a pas besoin de `- 1` (`ranger()` n'a pas d'intercept à retirer, et encode nativement les facteurs sans passer par `model.matrix()`).
+:::
+
+```{r diab-fit}
+fit_rf_diab <- fit_rf_repeated_cv(
+  data    = diabetes_data,
+  formula = y ~ .,
+  id_col  = "PatientID",
+  v = 5, repeats = 20, seed = 42
+)
+
+print(fit_rf_diab)
+```
+
+::: {.callout-tip title="📘 Paralléliser les 100 folds sur plusieurs coeurs"}
+Chaque fold (train/test + recherche de `mtry` + un `ranger::ranger()`) est indépendant des autres : `parallelisation = TRUE` les répartit sur plusieurs coeurs via `{parallel}` (base R, aucune installation supplémentaire), sans changer le résultat numérique (chaque fold fixe sa propre graine `seed + fold_num`) -- seul le temps de calcul change.
+
+- `n_cores = NULL` (défaut avec `parallelisation = TRUE`) : 2/3 des coeurs logiques détectés sur la machine, arrondi à l'entier inférieur.
+- `n_cores = <entier>` : impose ce nombre de coeurs.
+:::
+
+```{r diab-fit-parallele}
+#| eval: false
+
+# Résultat identique à fit_rf_diab ci-dessus, seul le temps de calcul change.
+fit_rf_diab_parallele <- fit_rf_repeated_cv(
+  data = diabetes_data, formula = y ~ ., id_col = "PatientID",
+  v = 5, repeats = 20, seed = 42,
+  parallelisation = TRUE           # n_cores = NULL -> 2/3 des coeurs detectes
+)
+
+# Ou en imposant explicitement un nombre de coeurs :
+fit_rf_diab_4coeurs <- fit_rf_repeated_cv(
+  data = diabetes_data, formula = y ~ ., id_col = "PatientID",
+  v = 5, repeats = 20, seed = 42,
+  parallelisation = TRUE, n_cores = 4
+)
+```
+
+```{r diab-imp-table}
+export_table(importance_table_rf(fit_rf_diab), caption = "Variables par importance -- modèle final (diabète, RF)")
+```
+
+## Stabilité de mtry : `check_hyperparam_stability_rf()` + `plot_hyperparam_path_rf()`
+
+::: {.callout-tip title="📘 Comment ça marche, et pourquoi tout de suite après l'ajustement"}
+Exactement le même réflexe que pour `lambda` côté Lasso : un `mtry` retenu au bord de sa grille testée (`mtry_grid`) signale qu'il faut l'élargir avant d'aller lire performance ou qualité de prédiction.
+:::
+
+```{r diab-mtry}
+#| fig-width: 8
+#| fig-height: 6
+
+check_hyperparam_stability_rf(fit_rf_diab)
+plot_hyperparam_path_rf(fit_rf_diab)
+plot_hyperparam_stability_rf(fit_rf_diab)
+```
+
+## Performance
+
+```{r diab-perf}
+perf_rf_diab <- model_performance.rf_cv_fit(fit_rf_diab)
+print(perf_rf_diab)
+```
+
+::: {.callout-tip title="📘 5 lectures de la qualité de prédiction"}
+`plot_prediction_quality_rf(fit, mode = ...)` -- mêmes 5 vues que côté Lasso (`"pooled"`, `"pooled_mean"`, `"final"`, `"overlay"`, `"panel"`), cf. tutoriel Lasso section A.1 pour le détail complet. Le mode `"final"` rappelle en plus le score OOB du modèle final, plus honnête que le R² d'entraînement affiché ; `"panel"` assemble `"final"` + `"pooled_mean"` + `"pooled"` côte à côte pour une vue d'ensemble en un coup d'oeil.
+:::
+
+```{r diab-pred-quality-panel}
+#| fig-width: 9
+#| fig-height: 9
+
+plot_prediction_quality_rf(fit_rf_diab, mode = "panel")
+```
+
+::: {.callout-note collapse="true" title="🔍 Voir aussi : les 4 vues individuelles (pooled, pooled_mean, final, overlay)"}
+```{r diab-pred-quality-detail}
+#| fig-width: 8
+#| fig-height: 6
+
+plot_prediction_quality_rf(fit_rf_diab, mode = "pooled")
+plot_prediction_quality_rf(fit_rf_diab, mode = "pooled_mean")
+plot_prediction_quality_rf(fit_rf_diab, mode = "final")
+plot_prediction_quality_rf(fit_rf_diab, mode = "overlay")
+```
+:::
+
+## Importance des variables : `check_importance_rf()` remplace le VIF
+
+::: {.callout-important title="📘 Pourquoi pas un VIF ici"}
+Le VIF (section correspondante du tutoriel Lasso) mesure une propriété du design matrix, sans objet pour une forêt aléatoire : `ranger()` ne requiert aucune condition de rang plein, et gère nativement des prédicteurs corrélés (ils se substituent l'un à l'autre selon les arbres). La question pertinente devient : *l'importance attribuée à chaque variable est-elle stable d'un tirage à l'autre ?*
+:::
+
+::: {.callout-important title="📘 Comment est calculée l'importance par permutation (RF)"}
+Pour chaque **arbre** de la forêt, `ranger()` procède ainsi :
+
+1. Il regarde les observations **out-of-bag (OOB)** de cet arbre -- celles qu'il n'a jamais vues à l'entraînement (environ 37% des données, laissées de côté par le tirage bootstrap de cet arbre précis).
+2. Il calcule l'erreur de prédiction de l'arbre sur ces observations OOB.
+3. Il **permute aléatoirement** les valeurs d'**une seule variable** parmi ces mêmes observations OOB (mélange les valeurs entre individus, détruisant le lien entre cette variable et la réponse pour cet arbre), puis recalcule l'erreur.
+4. L'importance de cette variable pour cet arbre = **la dégradation de l'erreur** causée par cette permutation. Si mélanger la variable ne change presque rien, elle ne comptait pas ; si l'erreur explose, elle comptait beaucoup.
+
+L'importance finale d'une variable = cette dégradation, **moyennée sur tous les arbres de la forêt**.
+
+**Pourquoi ce choix plutôt que l'importance "impurity" (Gini)** : cette dernière est calculée sur les données d'**entraînement** à partir de la baisse d'impureté à chaque split -- elle est connue pour être biaisée en faveur des variables continues ou à forte cardinalité, et optimiste car mesurée sur des données déjà vues. La permutation, calculée sur des données OOB, est plus honnête (analogue à la logique CV/modèle final déjà vue ailleurs dans ce document).
+
+`check_importance_rf()` répète ce calcul **par fold** de la CV répétée (100 fois dans cet exemple), pour ensuite mesurer la stabilité du classement -- pas juste l'importance sur un seul tirage.
+
+**Référence :** Breiman, L. (2001). *Random Forests.* Machine Learning, 45(1), 5–32.
+:::
+
+::: {.callout-tip title="📘 Comment lire plot_importance_rf() (le graphique en lollipop)"}
+Ce graphique résume, pour chaque variable, l'importance calculée sur les 100 folds :
+
+- **Longueur de la barre / position du point** (axe horizontal) : `mean_importance`, l'importance moyenne sur les 100 folds. Plus c'est grand, plus la variable compte en moyenne.
+- **Couleur** (vert → rouge, échelle "Instabilité") : `rank_sd`, l'écart-type du **rang** de cette variable (sa position dans le classement, 1 = la plus importante) d'un fold à l'autre. Vert = la variable garde à peu près la même position à chaque fois (signal stable). Rouge = son rang varie beaucoup selon l'échantillon d'entraînement (signal peu fiable). ⚠️ Une variable rouge en **bas** du graphique (importance déjà faible) n'est pas inquiétante en soi : quand beaucoup de variables ont une importance proche de 0, leur ordre relatif devient presque arbitraire d'un fold à l'autre -- un tout petit bruit d'estimation suffit à inverser leur rang.
+- **Forme du point** (rond vs triangle) : signe d'une corrélation de Spearman **marginale** (calculée directement sur les données brutes, hors du modèle) entre le prédicteur et la réponse. ⚠️ Ce n'est **pas** un effet partiel comme le signe d'un coefficient Lasso -- une variable peut avoir un effet réel non-monotone (en U, par seuils, en interaction avec une autre variable) pour lequel "positif" ou "négatif" n'a simplement pas de sens univoque. Pour une lecture fiable du sens de l'effet, utiliser `plot_shap()` plutôt que cette forme de point.
+:::
+
+::: {.callout-tip title="📘 Comment lire plot_variable_importance_rf() (les 2 panneaux)"}
+- **Panneau de gauche** ("Fréquence dans le top-15") : sur les 100 folds, dans quel pourcentage cette variable fait-elle partie des 15 plus importantes de CE fold ? 100% = elle y figure à **chaque** fold sans exception → signal très robuste. C'est l'équivalent le plus proche, côté RF, de "coefficient sélectionné" côté Lasso (une RF n'écarte jamais formellement une variable à 0, il faut donc ce critère arbitraire de "être dans le top-K").
+- **Panneau de droite** ("Amplitude de l'importance") : boxplot + points bruts de l'importance **brute** de cette variable sur les 100 folds (pas son rang, sa vraie valeur). Une boîte large ou des points très dispersés signalent une importance qui varie beaucoup selon l'échantillon d'entraînement -- indépendamment de sa fréquence de sélection à gauche.
+
+Ces 2 lectures sont complémentaires : une variable peut être *toujours* dans le top-15 (stabilité d'inclusion, panneau gauche) tout en ayant une magnitude d'importance très variable (panneau droit), ou l'inverse. Le sous-titre indique aussi combien de variables au total ont été vues au moins une fois dans le top-15 (`64 variable(s) ... sur 100 folds`) et combien sont masquées par le paramètre d'affichage (`top 30 affichées, 34 masquées`) -- augmenter `top_n` dans l'appel de la fonction pour en voir davantage.
+:::
+
+```{r diab-importance}
+#| fig-width: 8
+#| fig-height: 10
+
+imp_diab <- check_importance_rf(fit_rf_diab)
+print(imp_diab)
+plot_importance_rf(imp_diab, labels = labels_diabetes, fit = fit_rf_diab)
+```
+
+::: {.callout-tip title="📘 Fréquence dans le top-K, équivalent de plot_coefficient_importance()"}
+Un modèle RF n'écarte jamais formellement une variable à 0 (contrairement au Lasso) : `plot_variable_importance_rf()` retient donc, par convention, une variable "sélectionnée" si elle apparaît dans le top `top_k` par importance sur ce fold -- l'équivalent le plus proche de "coefficient != 0".
+:::
+
+```{r diab-var-importance}
+#| fig-width: 10
+#| fig-height: 8
+
+plot_variable_importance_rf(fit_rf_diab, labels = labels_diabetes, top_k = 15)
+```
+
+## Comment agissent-elles ? Forme des effets et SHAP
+
+```{r diab-effects}
+#| fig-width: 12
+#| fig-height: 7
+
+plot_effects_rf(fit_rf_diab, top_n = 6, labels = labels_diabetes)
+```
+
+::: {.callout-tip title="📘 Dépendance partielle et SHAP : deux façons de lire un effet"}
+La **dépendance partielle** (ci-dessus) trace la prédiction moyenne du modèle quand une variable varie (les autres gardant leurs valeurs) : sens et forme de l'effet **en moyenne** -- exactement ce que la forme du point (rond/triangle) de `plot_importance_rf()` ne peut PAS donner de façon fiable pour un effet non-monotone. Les **valeurs de Shapley** (`check_shap()`) attribuent, pour **chaque patient**, la part de sa prédiction due à chaque variable : elles montrent aussi l'hétérogénéité (une variable qui aide certains patients et pas d'autres). `check_shap()` utilise le **même algorithme Monte Carlo** pour toutes les méthodes du toolkit, donc les valeurs sont **comparables d'une méthode à l'autre** (`tutoriel_model_comparison_toolkit.qmd`).
+
+Seules les variables **numériques** sont tracées par `plot_effects_rf()` (les facteurs sont natifs à `ranger()`, mais ignorés ici par cette fonction, avec un message) ; `check_shap()` n'a pas cette limite.
+:::
+
+```{r diab-shap}
+#| fig-width: 10
+#| fig-height: 8
+
+shap_rf_diab <- check_shap(fit_rf_diab, method = "rf", nsim = 30, sample_size = 150)
+plot_shap(shap_rf_diab, labels = labels_diabetes, top_n = 15, type = "beeswarm")
+```
+
+## Cohérence entre répétitions
+
+```{r diab-indep}
+#| fig-width: 8
+#| fig-height: 6
+
+plot(check_independence_rf(fit_rf_diab))
+```
+
+::: {.callout-note collapse="true" title="🔍 Voir aussi : normalité, homoscédasticité, individus à erreur systématique (en détail)"}
+Ces 3 diagnostics sont déjà inclus, en plus compact, dans le panel `check_model_rf()` ci-dessous. Rappel : une forêt aléatoire ne suppose à aucun moment que ses résidus suivent une loi normale ou une variance constante -- normalité/homoscédasticité sont conservées ici uniquement pour comparer visuellement la FORME des résidus à celle obtenue avec le Lasso sur les mêmes données (cf. `tutoriel_model_comparison_toolkit.qmd`), jamais comme un diagnostic de mauvaise spécification du modèle RF.
+
+```{r diab-normality-hetero}
+#| fig-width: 7
+#| fig-height: 6
+
+norm_rf_diab   <- check_normality_rf(fit_rf_diab)
+hetero_rf_diab <- check_heteroscedasticity_rf(fit_rf_diab)
+print(norm_rf_diab)
+plot(norm_rf_diab)
+print(hetero_rf_diab)
+plot(hetero_rf_diab)
+```
+
+```{r diab-outliers}
+#| fig-width: 8
+#| fig-height: 6
+
+plot(check_outliers_rf(fit_rf_diab))
+```
+:::
+
+## Vue d'ensemble : `check_model_rf()`
+
+```{r diab-check-model}
+#| fig-width: 13
+#| fig-height: 15
+
+check_model_rf(fit_rf_diab, labels = labels_diabetes)
+```
+
+## Comparer 2 forêts : `compare_models_rf()`
+
+Comparaison, sur les MÊMES folds, entre la forêt complète (64 variables candidates) et une forêt restreinte aux quelques variables les plus fréquemment dans le top-15 par importance ci-dessus.
+
+```{r diab-var-restreintes}
+top_vars_diab <- check_importance_rf(fit_rf_diab, top_n = 8)$Variable
+formule_restreinte_diab <- stats::reformulate(paste0("`", top_vars_diab, "`"), response = "y")
+formule_restreinte_diab
+```
+
+```{r diab-compare}
+#| fig-width: 12
+#| fig-height: 8
+
+# IMPORTANT : cv_repeats = fit_rf_diab$cv_repeats, pour comparer les 2
+# forêts sur EXACTEMENT les mêmes folds (condition du test apparié).
+fit_rf_diab_restreint <- fit_rf_repeated_cv(
+  data = diabetes_data, formula = formule_restreinte_diab, id_col = "PatientID",
+  cv_repeats = fit_rf_diab$cv_repeats
+)
+
+comp_rf_diab <- compare_models_rf(
+  fits   = list(fit_rf_diab, fit_rf_diab_restreint),
+  labels = c("RF complète (64 var.)", sprintf("RF restreinte (%d var.)", length(top_vars_diab)))
+)
+comp_rf_diab$plot
+comp_rf_diab$pairwise
+comp_rf_diab$variables_summary
+```
+
+---
+
+# Partie B : Classification -- diagnostic de la maladie d'Alzheimer
+
+::: {.callout-tip title="📚 Origine des données"}
+Identique à la section B.1 du tutoriel Lasso -- cf. Craig-Schapiro et al. (2011), *PLOS ONE*, 6(4), e18850 ; package `{AppliedPredictiveModeling}`.
+:::
+
+```{r alz-load}
+library(AppliedPredictiveModeling)
+data(AlzheimerDisease)
+
+alzheimer_data <- predictors %>%
+  dplyr::mutate(diagnosis = diagnosis, PatientID = as.character(dplyr::row_number()))
+
+dim(alzheimer_data)
+table(alzheimer_data$diagnosis)
+```
+
+::: {.callout-note title="ℹ️ Labels des biomarqueurs"}
+Ce document n'y consacre pas un second dictionnaire complet : `labels_alzheimer` (une centaine d'entrées) est déjà défini dans `tutoriel_lasso_performance_toolkit.qmd` et directement réutilisable en sourçant ce chunk-là. Les exemples ci-dessous fonctionnent sans (`labels = NULL`), avec les noms de colonnes bruts.
+:::
+
+## Ajustement : `family = "binomial"`
+
+::: {.callout-note title="📘 Forêt de probabilité"}
+`fit_rf_repeated_cv(..., family = "binomial")` ajuste une forêt de **probabilité** (`ranger(probability = TRUE)`) : chaque feuille d'arbre stocke une proportion d'événements plutôt qu'une classe, et la prédiction finale est la moyenne de ces proportions sur tous les arbres -- une estimation de $P(Y=1\mid X)$, directement comparable à la sortie de `predict(cv.glmnet, type="response")` côté Lasso.
+
+**Référence :** Malley, J. D., Kruppa, J., Dasgupta, A., Malley, K. G., & Ziegler, A. (2012). *Probability Machines: Consistent Probability Estimation Using Nonparametric Learning Machines.* Methods of Information in Medicine, 51(1), 74–81.
+:::
+
+```{r alz-fit}
+fit_rf_alz <- fit_rf_repeated_cv(
+  data    = alzheimer_data,
+  formula = diagnosis ~ .,
+  id_col  = "PatientID",
+  family  = "binomial",
+  v = 5, repeats = 20, seed = 42
+)
+
+print(fit_rf_alz)
+```
+
+`fit_rf_alz$positive_class` indique quel niveau de `diagnosis` est traité comme l'événement "1" (2ᵉ niveau du facteur, dans l'ordre de ses `levels()`), exactement comme côté Lasso.
+
+```{r alz-imp-table}
+export_table(importance_table_rf(fit_rf_alz), caption = "Biomarqueurs par importance -- modèle final (Alzheimer, RF)")
+```
+
+## Stabilité de mtry
+
+```{r alz-mtry}
+#| fig-width: 8
+#| fig-height: 6
+
+check_hyperparam_stability_rf(fit_rf_alz)
+plot_hyperparam_path_rf(fit_rf_alz)
+```
+
+## Performance : Accuracy, AUC, Brier
+
+```{r alz-perf}
+perf_rf_alz <- model_performance.rf_cv_fit(fit_rf_alz)
+print(perf_rf_alz)
+```
+
+```{r alz-pred-quality}
+#| fig-width: 8
+#| fig-height: 6
+
+plot_prediction_quality_rf(fit_rf_alz)
+```
+
+## Importance des biomarqueurs
+
+```{r alz-importance}
+#| fig-width: 9
+#| fig-height: 16
+
+imp_alz <- check_importance_rf(fit_rf_alz, top_n = 30)
+print(imp_alz)
+plot_importance_rf(imp_alz, fit = fit_rf_alz)
+```
+
+```{r alz-var-importance}
+#| fig-width: 10
+#| fig-height: 8
+
+plot_variable_importance_rf(fit_rf_alz, top_k = 15)
+```
+
+```{r alz-effects}
+#| fig-width: 12
+#| fig-height: 7
+
+plot_effects_rf(fit_rf_alz, top_n = 6)
+```
+
+En classification, l'axe vertical de `plot_effects_rf()` est la **probabilité prédite** : on lit directement comment le risque évolue avec le biomarqueur.
+
+```{r alz-shap}
+#| fig-width: 10
+#| fig-height: 8
+
+shap_rf_alz <- check_shap(fit_rf_alz, method = "rf", nsim = 30, sample_size = 120)
+plot_shap(shap_rf_alz, top_n = 15, type = "bar")
+```
+
+::: {.callout-note collapse="true" title="🔍 Voir aussi : ROC, Précision-Rappel, calibration, matrice de confusion, outliers (en détail)"}
+ROC, calibration et matrice de confusion sont déjà inclus, en plus compact, dans le panel `check_model_rf()` ci-dessous ; la courbe Précision-Rappel est un complément non inclus dans ce panel.
+
+**Point de vigilance propre aux forêts de probabilité** : le moyennage de nombreux arbres tend à "tasser" les probabilités prédites vers 0.5 (peu d'observations atteignent des probabilités extrêmes proches de 0 ou 1, même quand le vrai signal est fort) -- surveiller un éventuel aplatissement systématique sur la courbe de calibration, un patron différent de ce qu'on chercherait côté Lasso.
+
+```{r alz-roc-pr-calib-confusion}
+#| fig-width: 7
+#| fig-height: 6
+
+plot_roc_rf(fit_rf_alz)
+plot_precision_recall_rf(fit_rf_alz)
+plot_calibration_rf(fit_rf_alz)
+plot_confusion_matrix_rf(fit_rf_alz)
+```
+
+```{r alz-outliers}
+#| fig-width: 8
+#| fig-height: 6
+
+plot(check_outliers_rf(fit_rf_alz))
+```
+:::
+
+## Vue d'ensemble
+
+```{r alz-check-model}
+#| fig-width: 13
+#| fig-height: 15
+
+check_model_rf(fit_rf_alz)
+```
+
+## Comparer 2 forêts
+
+```{r alz-var-restreintes}
+top_vars_alz <- check_importance_rf(fit_rf_alz, top_n = 8)$Variable
+formule_restreinte_alz <- stats::reformulate(paste0("`", top_vars_alz, "`"), response = "diagnosis")
+formule_restreinte_alz
+```
+
+```{r alz-compare}
+#| fig-width: 12
+#| fig-height: 8
+
+fit_rf_alz_restreint <- fit_rf_repeated_cv(
+  data = alzheimer_data, formula = formule_restreinte_alz, id_col = "PatientID",
+  family = "binomial", cv_repeats = fit_rf_alz$cv_repeats
+)
+
+comp_rf_alz <- compare_models_rf(
+  fits    = list(fit_rf_alz, fit_rf_alz_restreint),
+  labels  = c("RF complète (~130 var.)", sprintf("RF restreinte (%d var.)", length(top_vars_alz))),
+  metrics = c("accuracy", "auc")
+)
+comp_rf_alz$plot
+comp_rf_alz$pairwise
+```
+
+---
+
+::: {.callout-important title="🧭 Quelle branche chaque diagnostic couvre-t-il ?"}
+Même logique que côté Lasso (détail complet et justification dans `tutoriel_lasso_performance_toolkit.qmd`) : la plupart des diagnostics sont construits sur la **branche CV** (`fold_predictions`, `fold_importance`, `fold_hyperparams`) car ils cherchent des *patterns dans le résidu* qui n'existent que si l'on dispose de plusieurs estimations indépendantes du même individu -- le modèle final n'en offre qu'une, optimiste par construction. Deux exceptions vérifient spécifiquement le **modèle final** :
+
+- `check_hyperparam_stability_rf()` / `plot_hyperparam_path_rf()` -- `mtry` du modèle final est-il au bord de sa propre grille ?
+- `importance_table_rf()` -- importance **officielle** du modèle final (à distinguer de `plot_variable_importance_rf()`, qui résume la CV).
+- `plot_prediction_quality_rf(..., mode = "final"/"panel")`.
+
+**Checklist minimale** : `print(fit)` + `model_performance()` → `check_hyperparam_stability_rf()` + `plot_hyperparam_path_rf()` → `check_model_rf()` → `plot_variable_importance_rf()` → `plot_prediction_quality_rf(fit, mode = "panel")`.
+:::
+
+# Lire les visualisations d'ensemble
+
+::: {.callout-note collapse="true" title="📘 Détail des graphiques combinés (cliquer pour déplier)"}
+**`check_model_rf(fit)`** -- le grand panel combiné (4 à 6 vignettes selon `family`) :
+
+- *Régression* : qualité de prédiction (mode `"panel"`) · résidus vs valeurs prédites · Q-Q plot des résidus (descriptif -- la forêt ne suppose jamais leur normalité) · Scale-Location (homoscédasticité, descriptif).
+- *Classification* : qualité de prédiction (distribution des probabilités par classe) · courbe ROC · courbe de calibration · matrice de confusion.
+- Dernière vignette dans les deux cas : stabilité de l'importance des variables à travers les folds (`check_importance_rf()`), l'équivalent forêt du VIF/de la stabilité de la pénalisation des autres toolkits.
+
+**`plot_prediction_quality_rf(fit, mode = ...)`** -- les 5 mêmes lectures que côté Lasso (`"pooled"`, `"pooled_mean"`, `"final"`, `"overlay"`, `"panel"`) : voir le détail dans `tutoriel_lasso_performance_toolkit.qmd`, section « Lire les visualisations d'ensemble » -- le mode `"final"` reste optimiste (erreur OOB elle-même honnête, mais pas identique à la CV répétée du toolkit) et ne doit jamais servir à rapporter un chiffre.
+
+**`plot_variable_importance_rf(fit, top_k = 15)`** -- 2 panneaux côte à côte : fréquence dans le top-K par fold (barres), et amplitude de l'importance (boxplots) -- répond à 2 questions différentes : *combien de fois cette variable compte-t-elle parmi les plus importantes ?* et *à quel point, quand c'est le cas ?*
+
+**Courbes ROC / calibration / matrice de confusion** : mêmes conventions que le Lasso -- calculées par défaut sur les prédictions **poolées** de la CV (honnêtes), avec un mode `"overlay"` pour comparer au modèle final.
+
+**`compare_models_rf(fits)`** -- comparaison appariée entre 2 à 4 forêts partageant les mêmes folds (2 formules ou 2 réglages de `mtry_grid`) ; pour comparer la forêt à une AUTRE méthode, voir `tutoriel_model_comparison_toolkit.qmd`.
+:::
+
+# Récapitulatif : quelle fonction pour quel besoin ?
+
+| Besoin | Fonction | Équivalent Lasso | Branche |
+|---|---|---|---|
+| Ajuster le modèle en CV répétée | `fit_rf_repeated_cv()` | `fit_lasso_repeated_cv()` | Les deux (construit tout) |
+| Table des variables par importance | `importance_table_rf()` | `coef_table_lasso()` | Final |
+| Vérifier la grille d'hyperparamètre | `check_hyperparam_stability_rf()`, `plot_hyperparam_path_rf()` | `check_lambda_range_lasso()`, `plot_lambda_path_lasso()` | Les deux |
+| Stabilité entre folds | `plot_hyperparam_stability_rf()` | `plot_lambda_stability()` | CV |
+| R²/RMSE/MAE ou Accuracy/AUC/Brier | `model_performance.rf_cv_fit()` | `model_performance.lasso_cv_fit()` | CV |
+| Prédiction vs réel | `plot_prediction_quality_rf(fit, mode = ...)` | `plot_prediction_quality()` | Les deux (au choix du mode) |
+| Stabilité de l'effet d'une variable | `check_importance_rf()`, `plot_importance_rf()` | `check_collinearity_lasso()`, `plot_collinearity()` | CV |
+| Fréquence de sélection + amplitude | `plot_variable_importance_rf()` | `plot_coefficient_importance()` | CV |
+| Forme des résidus (descriptif) | `check_normality_rf()`, `check_heteroscedasticity_rf()` | `check_normality_lasso()`, `check_heteroscedasticity_lasso()` | CV |
+| Individus mal prédits | `check_outliers_rf()` | `check_outliers_lasso()` | CV (nécessite `repeats` ≥ 2) |
+| Cohérence entre répétitions | `check_independence_rf()` | `check_independence_lasso()` | CV (nécessite `repeats` ≥ 2) |
+| ROC / PR / calibration / confusion | `plot_roc_rf()`, `plot_precision_recall_rf()`, `plot_calibration_rf()`, `plot_confusion_matrix_rf()` | équivalents `*_lasso()` | CV |
+| Panel complet | `check_model_rf()` | `check_model_lasso()` | CV (panel) |
+| Comparer 2 à 4 forêts | `compare_models_rf()` | `compare_models_lasso()` | CV |
+| **Comparer Lasso et RF entre eux** | `compare_methods()` (`model_comparison_toolkit.R`) | — | CV |
+
+# Références complètes
+
+- Breiman, L. (2001). *Random Forests.* Machine Learning, 45(1), 5–32.
+- Breiman, L. (1996). *Bagging Predictors.* Machine Learning, 24(2), 123–140.
+- Wright, M. N., & Ziegler, A. (2017). *ranger: A Fast Implementation of Random Forests for High Dimensional Data in C++ and R.* Journal of Statistical Software, 77(1), 1–17.
+- Malley, J. D. et al. (2012). *Probability Machines.* Methods of Information in Medicine, 51(1), 74–81.
+- Efron, B., Hastie, T., Johnstone, I., & Tibshirani, R. (2004). *Least Angle Regression.* Annals of Statistics, 32(2), 407–499.
+- Craig-Schapiro, R. et al. (2011). *Multiplexed immunoassay panel identifies novel CSF biomarkers for Alzheimer's disease diagnosis and prognosis.* PLOS ONE, 6(4), e18850.
+- Cf. aussi toutes les références déjà citées dans `tutoriel_lasso_performance_toolkit.qmd` pour les diagnostics repris à l'identique (normalité, ROC, calibration...).

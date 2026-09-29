@@ -1,0 +1,1578 @@
+---
+title: "Lasso en validation croisée répétée"
+author: "Clément Poupelin"
+date: 09-17-2026
+date-modified: "`r Sys.Date()`"
+format: 
+  html:
+    embed-resources: false
+    toc: true
+    code-fold: true
+    code-summary: "Show the code"
+    code-tools: true
+    toc-location: right
+    page-layout: article
+    code-overflow: wrap
+number-sections: false
+editor: visual
+categories: ["High Dimensional Statistics", "Linear Models", "Lasso Regression"]
+description: "Guide pratique du toolkit `lasso_performance_toolkit.R`"
+execute: 
+  echo: true 
+  warning: false 
+  message: false
+  error: true
+---
+
+```{=html}
+<!--
+=================================================================================
+tutoriel_lasso_performance_toolkit.qmd
+=================================================================================
+Document AUTONOME. 4 exemples complets, croisant famille (gaussien/binomial) et
+régime dimensionnel (p < n modéré vs p >> n grande dimension) :
+
+  A.1 Gaussien,  p < n  (p=64,   n=442) -- lars::diabetes (progression du diabète)
+  A.2 Gaussien,  p >> n (p=2307, n=83)  -- ISLR2::Khan (expression d'un gène ~ les autres)
+  B.1 Binomial,  p < n  (p≈130,  n=333) -- AppliedPredictiveModeling::AlzheimerDisease
+  B.2 Binomial,  p >> n (p=2308, n<=83) -- ISLR2::Khan (sous-ensemble à 2 types de tumeur)
+
+CHOIX DE PACKAGES : {ISLR2} (compagnon du manuel "An Introduction to
+Statistical Learning"), {AppliedPredictiveModeling} (compagnon du manuel
+"Applied Predictive Modeling", Kuhn & Johnson) et {lars} (le jeu diabetes
+d'Efron et al. 2004, l'article fondateur de LARS -- mirroré indépendamment
+dans au moins 5 autres packages CRAN actifs : l2boost, hsstan, islasso,
+bcaboot, BayesBridge) -- des choix nettement moins susceptibles d'être un
+jour archivés que les packages de recherche méthodologique pointue utilisés
+dans les versions précédentes de ce tutoriel ({lasso2}, {hdi} -- tous deux
+retirés de CRAN depuis).
+
+PRÉREQUIS
+---------
+install.packages(c("ISLR2", "AppliedPredictiveModeling", "lars", "glmnet",
+                    "rsample", "dplyr", "tidyr", "purrr", "tibble",
+                    "ggplot2", "patchwork", "car", "nortest", "ggrepel",
+                    "knitr", "viridis", "DT"))
+
+Le fichier lasso_performance_toolkit.R doit se trouver dans le même dossier
+que ce document (installer le package : devtools::install("cvperf")).
+
+NOUVEAUTÉS DE CETTE VERSION
+----------------------------------
+- La vérification de la grille de lambda (check_lambda_range_lasso() /
+  plot_lambda_path_lasso()) est désormais placée JUSTE APRÈS l'ajustement,
+  avant performance/qualité de prédiction : c'est à ce stade qu'on décide
+  d'élargir ou non la grille, avant de lire des résultats qui pourraient
+  sinon porter sur un modèle mal calibré dès le départ.
+- plot_prediction_quality(fit, mode = "pooled"/"pooled_mean"/"final"/"overlay"/"panel") :
+  une seule fonction, 5 vues (cf. section A.1 pour le détail).
+- check_collinearity_lasso(..., fit = ..., selected_only = TRUE) : VIF
+  restreint aux variables du modèle final -- souvent CALCULABLE même en
+  régime p >> n, puisque le nombre de variables retenues est généralement
+  très inférieur à n (cf. sections A.2/B.2).
+
+AVERTISSEMENT DE TEMPS DE CALCUL
+----------------------------------
+Les sections A.2 et B.2 (p >> n, ~2300 prédicteurs) prennent de l'ordre de la
+minute chacune (glmnet reste rapide grâce à la descente de coordonnées, mais
+la charge est mécaniquement plus lourde qu'avec 57 ou 130 prédicteurs).
+=================================================================================
+-->
+```
+
+```{r setup}
+#| include: false
+
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(tibble)
+library(ggplot2)
+library(patchwork)
+library(glmnet)
+library(rsample)
+library(car)
+library(nortest)
+library(ggrepel)
+library(viridis)
+library(knitr)
+library(DT)
+
+library(cvperf)
+```
+
+```{r export-table-helper}
+#| include: false
+
+#' Tableau interactif avec export CSV/Excel -- pour que les chercheurs
+#' puissent récupérer directement la liste des variables sélectionnées (ou
+#' toute autre table de ce document) dans leur tableur habituel.
+#' Extension {Buttons} de DT : les boutons csv/excel fonctionnent côté
+#' client (JS embarqué), aucune dépendance R supplémentaire nécessaire.
+export_table <- function(df, caption = NULL, page_length = 10) {
+  DT::datatable(
+    df,
+    caption   = caption,
+    rownames  = FALSE,
+    filter    = "top",
+    extensions = "Buttons",
+    options = list(
+      dom        = "Bfrtip",
+      buttons    = c("csv", "excel"),
+      pageLength = page_length,
+      scrollX    = TRUE
+    )
+  )
+}
+```
+
+```{r}
+# =============================================================================
+# 2. FONCTION GÉNÉRIQUE DE NETTOYAGE — pour Khan et Alzheimer
+# =============================================================================
+# Pas de dictionnaire biologique fiable disponible pour ces 2 jeux (gènes
+# non annotés pour Khan ; liste exacte des ~130 biomarqueurs Alzheimer non
+# vérifiée de mon côté) -- cette fonction fait un nettoyage cosmétique
+# générique (remplace les séparateurs, raccourcit), PAS une traduction
+# biologique. À affiner à la main si tu identifies des noms précis à
+# améliorer.
+
+.nettoyer_label <- function(x, max_len = 18) {
+  x <- gsub("[._]+", " ", x)              # points/underscores -> espaces
+  x <- trimws(x)
+  ifelse(nchar(x) > max_len, paste0(substr(x, 1, max_len - 1), "\u2026"), x)
+}
+
+
+```
+
+# Pourquoi ce tutoriel
+
+Ce document est à la fois un vrai fil d'analyse (4 jeux de données réels, jusqu'au bout) et une documentation d'usage du toolkit `lasso_performance_toolkit.R`, construit autour d'une architecture inspirée du package R [**{performance}**](https://easystats.github.io/performance/) (Lüdecke et al., 2021) — une fonction `check_*()` par hypothèse à vérifier, chacune avec sa méthode `plot()`, assemblées en un grand panel par `check_model_lasso()`.
+
+::: {.callout-important title="Pourquoi croiser 2 régimes dimensionnels"}
+Avec seulement quelques prédicteurs candidats, le Lasso ne fait quasiment aucune sélection : presque toutes les variables finissent par être retenues, et l'intérêt de la pénalisation L1 par rapport à une régression classique reste peu visible. **Le Lasso a été conçu pour le régime** $p \gg n$ — c'est là qu'une régression non pénalisée (OLS) n'est même plus *identifiable* (matrice de design non inversible). Mais le Lasso reste aussi parfaitement utilisable, et le VIF reste calculable, en régime $p < n$ modéré (quelques dizaines de prédicteurs) : ce tutoriel présente donc les 2 cas, systématiquement, pour la régression gaussienne comme pour la régression logistique.
+:::
+
+::: {.callout-note title="📘 Pourquoi une validation croisée *répétée*, pas un simple split train/test ?"}
+Un unique découpage train/test donne une estimation de performance qui peut être trompeuse — particulièrement sur de petits échantillons. Répéter la validation croisée (`v` folds × `repeats` répétitions) permet d'observer la **distribution** de la performance plutôt qu'un seul point.
+
+**Références :**
+
+-   Kohavi, R. (1995). *A study of cross-validation and bootstrap for accuracy estimation and model selection.* Proceedings of IJCAI.
+-   Varma, S., & Simon, R. (2006). *Bias in error estimation when using cross-validation for model selection.* BMC Bioinformatics, 7, 91.
+:::
+
+::: {.callout-tip title="📚 Package central : glmnet"}
+-   Friedman, J., Hastie, T., & Tibshirani, R. (2010). *Regularization Paths for Generalized Linear Models via Coordinate Descent.* Journal of Statistical Software, 33(1), 1–22.
+-   Hastie, T., Qian, J., & Tay, K. *An Introduction to glmnet.* Vignette officielle : <https://glmnet.stanford.edu/articles/glmnet.html>
+:::
+
+# Fondations : comprendre le Lasso de zéro
+
+## L'idée en une phrase
+
+> **Le Lasso est une régression linéaire ordinaire à laquelle on ajoute une pénalité qui pousse les coefficients vers zéro -- et, pour certains d'entre eux, exactement à zéro.** Ceux qui restent non nuls sont les variables que le modèle juge utiles.
+
+Une régression classique (OLS) ajuste ses coefficients pour coller au mieux aux données d'entraînement, sans se soucier de leur nombre ni de leur amplitude -- avec beaucoup de prédicteurs ou des prédicteurs corrélés, elle sur-ajuste facilement et devient instable (voire, en régime $p \gg n$, elle n'est même plus calculable). Le Lasso résout les deux problèmes à la fois : il régularise (réduit l'amplitude des coefficients) et sélectionne (en annule certains).
+
+## La pénalisation L1
+
+Le Lasso (*Least Absolute Shrinkage and Selection Operator*, Tibshirani 1996) ajoute à la régression une pénalité sur la valeur absolue des coefficients :
+
+$$\hat{\beta}_{\text{lasso}} = \arg\min_\beta \left\{ \underbrace{\frac{1}{2n}\sum_{i=1}^n (y_i - x_i^\top \beta)^2}_{\text{ajustement aux donnees}} \;+\; \underbrace{\lambda \sum_{j=1}^p |\beta_j|}_{\text{penalite L1}} \right\}$$
+
+`lambda` ($\lambda$) règle l'équilibre : $\lambda = 0$ redonne la régression classique (aucune pénalité) ; $\lambda$ grand écrase tous les coefficients vers 0 (modèle vide). Entre les deux, `cv.glmnet()` choisit, par validation croisée interne, la valeur qui prédit le mieux -- ni trop de bruit collé (petit $\lambda$), ni trop de signal perdu (grand $\lambda$).
+
+## Pourquoi L1 annule des coefficients (et pas L2)
+
+La régression Ridge utilise une pénalité L2 ($\lambda \sum \beta_j^2$) : elle rétrécit les coefficients mais ne les annule presque jamais exactement. La différence vient de la **forme géométrique** de la contrainte : minimiser l'erreur sous une contrainte $\sum|\beta_j| \le t$ (losange, L1) revient à chercher où les ellipses d'erreur constante touchent ce losange pour la première fois -- et ce point de contact tombe très souvent sur un **coin** du losange, où une coordonnée est exactement nulle. La même recherche sous une contrainte $\sum\beta_j^2 \le t$ (cercle, L2) touche presque toujours le cercle en un point où aucune coordonnée n'est nulle.
+
+```{r}
+#| label: fig-l1-l2-geometry
+#| fig-width: 9
+#| fig-height: 4.4
+ #| fig-cap: "Vue géométrique en 2 coefficients (β1, β2). Le point rouge = solution non pénalisée (β̂). Les ellipses = valeurs d'erreur croissante autour de β. La solution pénalisée est le premier point où une ellipse touche la région autorisée (bleu). À gauche (Lasso, L1, losange) : ce contact tombe souvent sur un coin -- β1 = 0 exactement. À droite (Ridge, L2, cercle) : le contact tombe rarement sur un axe -- aucun coefficient n'est annulé."
+
+beta_hat <- c(2.2, 0.5)
+Sigma <- matrix(c(1, 0.3, 0.3, 0.6), 2)
+ellipse_pts <- function(rayon) {
+  ang <- seq(0, 2*pi, length.out = 200)
+  cercle <- cbind(cos(ang), sin(ang)) * rayon
+  chol_s <- chol(Sigma)
+  pts <- cercle %*% chol_s
+  tibble::tibble(b1 = beta_hat[1] + pts[,1], b2 = beta_hat[2] + pts[,2])
+}
+ellipses <- purrr::map_dfr(c(0.35, 0.7, 1.05, 1.4), ~ dplyr::mutate(ellipse_pts(.x), rayon = .x))
+
+t_val <- 1.15
+losange <- tibble::tibble(b1 = c(t_val, 0, -t_val, 0, t_val), b2 = c(0, t_val, 0, -t_val, 0))
+theta <- seq(0, 2*pi, length.out = 200)
+cercle_c <- tibble::tibble(b1 = t_val * cos(theta), b2 = t_val * sin(theta))
+
+p_l1 <- ggplot() +
+  geom_polygon(data = losange, aes(b1, b2), fill = "#2C7FB8", alpha = 0.25, colour = "#2C7FB8") +
+  geom_path(data = ellipses, aes(b1, b2, group = rayon), colour = "grey45", linewidth = 0.4) +
+  geom_point(aes(x = beta_hat[1], y = beta_hat[2]), colour = "#B2182B", size = 2.5) +
+  geom_point(aes(x = t_val, y = 0), colour = "#1B9E77", size = 3) +
+  annotate("text", x = t_val, y = 0.25, label = "solution Lasso\n(β2 = 0)", size = 2.9, colour = "#1B9E77") +
+  coord_equal(xlim = c(-1.6, 2.6), ylim = c(-1.6, 1.6)) +
+  labs(title = "Contrainte L1 (Lasso) : un losange", x = expression(beta[1]), y = expression(beta[2])) +
+  theme_minimal(base_size = 10)
+
+p_l2 <- ggplot() +
+  geom_polygon(data = cercle_c, aes(b1, b2), fill = "#D95F02", alpha = 0.25, colour = "#D95F02") +
+  geom_path(data = ellipses, aes(b1, b2, group = rayon), colour = "grey45", linewidth = 0.4) +
+  geom_point(aes(x = beta_hat[1], y = beta_hat[2]), colour = "#B2182B", size = 2.5) +
+  geom_point(aes(x = t_val * cos(0.35), y = t_val * sin(0.35)), colour = "#1B9E77", size = 3) +
+  annotate("text", x = t_val * cos(0.35), y = t_val * sin(0.35) + 0.3, label = "solution Ridge\n(aucun coef. nul)", size = 2.9, colour = "#1B9E77") +
+  coord_equal(xlim = c(-1.6, 2.6), ylim = c(-1.6, 1.6)) +
+  labs(title = "Contrainte L2 (Ridge) : un cercle", x = expression(beta[1]), y = expression(beta[2])) +
+  theme_minimal(base_size = 10)
+
+p_l1 | p_l2
+```
+
+## Le chemin de régularisation : comment les coefficients disparaissent
+
+À mesure que $\lambda$ augmente, chaque coefficient suit son propre chemin vers zéro -- certains disparaissent tôt (variables faiblement liées à la réponse), d'autres résistent longtemps (variables fortement liées). C'est ce que trace `glmnet::glmnet()` en ajustant le modèle pour toute une grille de $\lambda$ à la fois (par descente de coordonnées, Friedman et al. 2010) :
+
+```{r}
+#| label: fig-lasso-path
+#| fig-width: 8.5
+#| fig-height: 4.6
+#| fig-cap: "Chemin de régularisation (glmnet) sur des données simulées (6 prédicteurs, 3 réellement liés à y). Chaque courbe = un coefficient. La ligne pointillée = lambda choisi par cv.glmnet() (compromis biais/variance) : à gauche de cette ligne, des coefficients supplémentaires sont encore à zéro (modèle trop simple) ; à droite, ils recommencent à s'écarter de zéro (modèle plus riche, plus de variance)."
+
+set.seed(11)
+n_p <- 100
+X_p <- matrix(rnorm(n_p * 6), n_p, 6, dimnames = list(NULL, paste0("V", 1:6)))
+beta_p <- c(1.8, -1.2, 0.9, 0, 0, 0)
+y_p <- as.numeric(X_p %*% beta_p) + rnorm(n_p, 0, 1)
+
+fit_path <- glmnet::glmnet(X_p, y_p)
+cv_path  <- glmnet::cv.glmnet(X_p, y_p)
+
+coefs_path <- as.matrix(fit_path$beta) %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("Variable") %>%
+  tidyr::pivot_longer(-Variable, names_to = "step", values_to = "Coefficient") %>%
+  dplyr::mutate(lambda = rep(fit_path$lambda, times = nrow(fit_path$beta))) %>%
+  dplyr::mutate(Lien_reel = ifelse(Variable %in% c("V1","V2","V3"), "Liée à y (β ≠ 0)", "Non liée (β = 0)"))
+
+ggplot(coefs_path, aes(lambda, Coefficient, colour = Variable, linetype = Lien_reel)) +
+  geom_line(linewidth = 0.9) +
+  geom_vline(xintercept = cv_path$lambda.min, linetype = "dashed", colour = "grey40") +
+  scale_x_log10() +
+  annotate("text", x = cv_path$lambda.min, y = max(coefs_path$Coefficient) * 0.9,
+           label = "lambda.min", hjust = -0.1, size = 3, colour = "grey40") +
+  labs(title = "Chemin de régularisation du Lasso", subtitle = "6 prédicteurs simulés, dont 3 réellement liés à y",
+       x = "lambda (échelle log)", y = "Coefficient", linetype = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(plot.subtitle = element_text(colour = "grey45", size = 9))
+```
+
+Les 3 variables réellement liées à `y` (traits pleins) restent non nulles bien plus longtemps que les 3 variables de bruit (traits pointillés), qui sont annulées presque immédiatement -- c'est exactement le mécanisme de sélection que `coef_table_lasso()` lit sur le modèle final, et que `check_collinearity_lasso()`/`plot_lambda_stability()` évaluent à travers les folds.
+
+**Références :**
+
+-   Tibshirani, R. (1996). *Regression Shrinkage and Selection via the Lasso.* JRSS B, 58(1), 267–288.
+-   Hastie, T., Tibshirani, R., & Wainwright, M. (2015). *Statistical Learning with Sparsity: The Lasso and Generalizations.* CRC Press.
+-   Bühlmann, P., & van de Geer, S. (2011). *Statistics for High-Dimensional Data.* Springer.
+-   Friedman, J., Hastie, T., & Tibshirani, R. (2010). *Regularization Paths for Generalized Linear Models via Coordinate Descent.* Journal of Statistical Software, 33(1), 1–22.
+
+# Avantages et limites du Lasso
+
+::: {.callout-tip title="✅ Ce que le Lasso apporte"}
+-   **Interprétable et communicable** : chaque variable retenue a un coefficient unique, dans l'unité de la réponse (ou en log-odds pour la régression logistique) -- lisible directement, sans dépendance partielle ni SHAP.
+-   **Sélection de variables intégrée** : une variable est dans le modèle ou n'y est pas (`coef_table_lasso()`), ce qui donne une liste de candidats courte et actionnable -- utile pour désigner des biomarqueurs à approfondir.
+-   **Le seul des 5 modèles de la série où le VIF reste calculable** (`check_collinearity_lasso()`) : un diagnostic de multicolinéarité classique, bien connu, avec des seuils établis.
+-   **Rapide** : `cv.glmnet()` est de loin la méthode la plus rapide de la série (cf. `computational_info` de chaque fit) -- adapté à de très nombreux folds/répétitions même en $p \gg n$.
+-   **Fonctionne quand** $p > n$, régime où une régression non pénalisée (OLS) n'est plus calculable du tout.
+:::
+
+::: {.callout-warning title="⚠️ Ce que le Lasso ne fait pas"}
+-   **Effet strictement linéaire** : un coefficient unique par variable -- aucun seuil, palier ni changement de régime, sauf à les construire soi-même (termes polynomiaux, indicatrices). MARS ou une méthode à base d'arbres captent cela nativement.
+-   **Aucune interaction**, sauf à l'ajouter explicitement dans la formule (`x1:x2`) -- et le nombre de termes croît vite avec le nombre de variables.
+-   **Sélection instable entre variables corrélées** : face à 2 variables très corrélées portant la même information, le Lasso a tendance à n'en garder qu'une, presque arbitrairement -- celle écartée peut sembler « sans effet » alors qu'elle est simplement redondante avec l'autre. `plot_lambda_stability()`/`check_collinearity_lasso()` aident à repérer ce cas.
+-   **Biais de rétrécissement** : même les coefficients non nuls sont systématiquement tirés vers 0 (nécessaire à la sélection, mais sous-estime l'amplitude des vrais effets) -- un correctif classique est le *relaxed Lasso* ou un second ajustement OLS restreint aux variables sélectionnées, non implémenté ici.
+:::
+
+## Vue d'ensemble des 4 exemples
+
+| Exemple | Famille | Jeu de données | n | p | Régime |
+|------------|------------|------------|------------|------------|------------|
+| A.1 | Gaussienne | `diabetes` (progression du diabète) | 442 | 64 | $p < n$ (modéré) |
+| A.2 | Gaussienne | `Khan` (expression d'un gène) | 83 | 2307 | $p \gg n$ |
+| B.1 | Logistique | `AlzheimerDisease` | 333 | ≈130 | $p < n$ (modéré) |
+| B.2 | Logistique | `Khan` (type de tumeur) | ≤83 | 2308 | $p \gg n$ |
+
+------------------------------------------------------------------------
+
+# Deux processus indépendants : boucle de CV et modèle final
+
+Cette section est valable pour **tous** les exemples de ce document (et de `tutoriel_rf_performance_toolkit.qmd`) : à chaque fois qu'un `fit_*_repeated_cv()` est ajusté, il produit à la fois les 100 modèles de la boucle de CV et un modèle final distinct, selon le schéma ci-dessous.
+
+```{=html}
+<svg width="100%" viewBox="0 0 680 560" role="img" xmlns="http://www.w3.org/2000/svg" style="max-width:680px;display:block;margin:0 auto;">
+<title>Boucle de validation croisée versus construction du modèle final</title>
+<desc>Deux processus indépendants partant des mêmes données : à gauche, 100 modèles de CV entraînés chacun sur environ 80% des données pour estimer la performance ; à droite, un seul modèle final entraîné sur 100% des données. Les deux résultats se combinent ensuite dans le plot en mode pooled.</desc>
+<defs>
+  <marker id="cvArrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+    <path d="M2 1L8 5L2 9" fill="none" stroke="#888888" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  </marker>
+</defs>
+
+<text x="40" y="50" style="font:500 14px sans-serif; fill:#1a1a1a;">Boucle de CV (validation)</text>
+<text x="350" y="50" style="font:500 14px sans-serif; fill:#1a1a1a;">Modèle final (déploiement)</text>
+
+<g>
+  <rect x="40" y="64" width="290" height="56" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+  <text x="185" y="84" text-anchor="middle" style="font:500 14px sans-serif; fill:#085041;">Données complètes</text>
+  <text x="185" y="104" text-anchor="middle" style="font:400 12px sans-serif; fill:#0F6E56;">100% des individus (n)</text>
+</g>
+<line x1="185" y1="120" x2="185" y2="148" stroke="#888888" stroke-width="1.5" marker-end="url(#cvArrow)"/>
+
+<g>
+  <rect x="40" y="148" width="290" height="56" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+  <text x="185" y="168" text-anchor="middle" style="font:500 14px sans-serif; fill:#085041;">100 découpages aléatoires</text>
+  <text x="185" y="188" text-anchor="middle" style="font:400 12px sans-serif; fill:#0F6E56;">5 folds × 20 répétitions</text>
+</g>
+<line x1="185" y1="204" x2="185" y2="232" stroke="#888888" stroke-width="1.5" marker-end="url(#cvArrow)"/>
+
+<g>
+  <rect x="40" y="232" width="290" height="56" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+  <text x="185" y="252" text-anchor="middle" style="font:500 14px sans-serif; fill:#085041;">100 modèles distincts</text>
+  <text x="185" y="272" text-anchor="middle" style="font:400 12px sans-serif; fill:#0F6E56;">chacun entraîné sur ~80%</text>
+</g>
+<line x1="185" y1="288" x2="185" y2="316" stroke="#888888" stroke-width="1.5" marker-end="url(#cvArrow)"/>
+
+<g>
+  <rect x="40" y="316" width="290" height="56" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+  <text x="185" y="336" text-anchor="middle" style="font:500 14px sans-serif; fill:#085041;">Prédictions sur le 20% test</text>
+  <text x="185" y="356" text-anchor="middle" style="font:400 12px sans-serif; fill:#0F6E56;">jamais vu par CE modèle</text>
+</g>
+
+<g>
+  <rect x="350" y="64" width="290" height="56" rx="8" fill="#FAECE7" stroke="#993C1D" stroke-width="0.5"/>
+  <text x="495" y="84" text-anchor="middle" style="font:500 14px sans-serif; fill:#712B13;">Données complètes</text>
+  <text x="495" y="104" text-anchor="middle" style="font:400 12px sans-serif; fill:#993C1D;">100% des individus (n)</text>
+</g>
+<line x1="495" y1="120" x2="495" y2="148" stroke="#888888" stroke-width="1.5" marker-end="url(#cvArrow)"/>
+
+<g>
+  <rect x="350" y="148" width="290" height="56" rx="8" fill="#FAECE7" stroke="#993C1D" stroke-width="0.5"/>
+  <text x="495" y="168" text-anchor="middle" style="font:500 14px sans-serif; fill:#712B13;">Tuning interne propre</text>
+  <text x="495" y="188" text-anchor="middle" style="font:400 12px sans-serif; fill:#993C1D;">cv.glmnet (λ) / OOB (mtry)</text>
+</g>
+<line x1="495" y1="204" x2="495" y2="232" stroke="#888888" stroke-width="1.5" marker-end="url(#cvArrow)"/>
+
+<g>
+  <rect x="350" y="232" width="290" height="56" rx="8" fill="#FAECE7" stroke="#993C1D" stroke-width="0.5"/>
+  <text x="495" y="252" text-anchor="middle" style="font:500 14px sans-serif; fill:#712B13;">1 seul modèle</text>
+  <text x="495" y="272" text-anchor="middle" style="font:400 12px sans-serif; fill:#993C1D;">entraîné sur les 100%</text>
+</g>
+
+<line x1="185" y1="372" x2="185" y2="430" stroke="#888888" stroke-width="1.5" marker-end="url(#cvArrow)"/>
+<line x1="495" y1="288" x2="495" y2="430" stroke="#888888" stroke-width="1.5" marker-end="url(#cvArrow)"/>
+
+<g>
+  <rect x="90" y="430" width="500" height="80" rx="8" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.5"/>
+  <text x="340" y="452" text-anchor="middle" style="font:500 14px sans-serif; fill:#3C3489;">Plot mode "pooled"</text>
+  <text x="340" y="474" text-anchor="middle" style="font:400 12px sans-serif; fill:#534AB7;">Trait bleu = étendue (gauche, 100 modèles)</text>
+  <text x="340" y="496" text-anchor="middle" style="font:400 12px sans-serif; fill:#534AB7;">Point orange = modèle final (droite, 1 modèle)</text>
+</g>
+</svg>
+```
+
+*Les deux processus partent des mêmes données mais restent ensuite totalement indépendants -- le modèle final n'est jamais construit à partir des 100 modèles de la CV.*
+
+::: {.callout-note title="🎯 Si les deux sont indépendants, à quoi sert la CV pour le modèle final ?"}
+La CV ne construit **pas** le modèle final -- elle a un rôle différent, et indispensable : estimer **honnêtement** la performance de généralisation de *la même recette* (même formule, même façon de choisir `lambda`) avant de l'appliquer une dernière fois sur 100% des données pour obtenir le modèle réellement utilisé en pratique.
+
+Sans la CV, le seul chiffre de performance disponible serait celui du modèle final évalué sur les données qui ont servi à l'entraîner -- optimiste par construction (cf. le R² d'entraînement = 0.911 du mode `"final"`, très loin du R² honnête = 0.446 de la CV). C'est une évaluation **trichée** : le modèle a déjà "vu" chaque point qu'on lui demande de prédire.
+
+Ce que la CV répétée apporte concrètement, que le modèle final seul ne peut pas fournir :
+
+-   **Le seul chiffre de performance à reporter** (R², RMSE, AUC...) -- celui du modèle final serait trompeur.
+-   **Toutes les fonctions `check_*()`** (stabilité de `lambda`, VIF, importance des variables, outliers, indépendance...) : elles ont besoin de PLUSIEURS modèles pour évaluer une stabilité -- un seul modèle final ne peut rien dire sur sa propre variabilité.
+-   **Une comparaison équitable** entre 2 formules ou 2 méthodes (`compare_models_lasso()`, `compare_methods()`) : comparer des scores d'entraînement serait injuste.
+-   **Le trait bleu** de ce plot -- un repère visuel de variabilité, même s'il ne s'agit pas d'un intervalle de confiance formel.
+
+Analogie : la CV est un peu comme un entretien d'embauche, le modèle final est la personne effectivement recrutée. L'entretien ne fabrique pas l'employé, mais il permet de faire confiance à la méthode de recrutement avant de l'appliquer une dernière fois, avec toutes les ressources, pour le recrutement définitif.
+:::
+
+::: {.callout-important title="🧮 Comment le modèle final est-il vraiment calculé ?"}
+Les coefficients du modèle final ne sont **pas** une moyenne ni un résumé des 100 modèles de CV -- c'est un calcul complètement indépendant, fait une seule fois : un nouvel appel à `cv.glmnet(X_complet, y_complet)`, qui fait sa **propre** petite CV interne (10-fold par défaut) rien que pour choisir `lambda`, puis un `glmnet()` final ajusté à ce `lambda` sur 100% des données. Les 100 modèles de l'étape de validation ne sont jamais réutilisés ici -- leurs coefficients sont même jetés une fois l'estimation de performance calculée.
+
+**D'où vient le biais du mode `"final"`** : pour ce mode, on prend ce modèle unique, on calcule $\hat{y} = f(X)$ pour **chaque individu qui a servi à l'entraîner**, et on compare à son $y$ réel. Le modèle a ajusté ses coefficients précisément pour bien coller à *ces* points -- donc le réévaluer sur les mêmes points le fait mécaniquement "tricher". C'est le biais classique d'évaluation intra-échantillon (*in-sample*) : on mesure la mémoire du modèle, pas sa capacité à généraliser.
+:::
+
+::: {.callout-tip title="🎯 En pratique : comment utiliser et interpréter le modèle final"}
+1.  **Pour prédire un nouveau patient** : c'est exactement à ça que sert le modèle final -- `predict(fit$final_model, newdata = nouveau_patient)`. Aucun biais ici : ce patient n'a jamais participé à l'entraînement.
+2.  **Pour rapporter une performance** (article, rapport) : toujours le chiffre de la CV poolée (`model_performance()$pooled`) -- jamais le R² d'entraînement du mode `"final"`. C'est la seule estimation honnête de ce à quoi s'attendre sur de nouveaux patients.
+3.  **Pour interpréter les coefficients/l'importance** : ceux du modèle final (`coef_table_lasso()`/`importance_table_rf()`) sont "la" version officielle à communiquer -- mais pour juger s'ils sont **fiables/stables**, retourner aux diagnostics de CV (`check_collinearity_lasso()`, `check_importance_rf()`, `plot_coefficient_importance()`), qui seuls peuvent parler de variabilité puisqu'ils disposent de 100 estimations.
+4.  **Vigilance à l'extrapolation** : un nouveau patient dont les caractéristiques sortent de la plage observée dans les données d'entraînement expose le modèle à un risque d'extrapolation -- la performance honnête de la CV ne couvre que les individus ressemblant à l'échantillon utilisé ici.
+:::
+
+------------------------------------------------------------------------
+
+# Partie A : Régression gaussienne
+
+## A.1 : Régime $p < n$ : progression du diabète
+
+::: {.callout-tip title="📚 Origine des données"}
+-   Efron, B., Hastie, T., Johnstone, I., & Tibshirani, R. (2004). *Least Angle Regression.* The Annals of Statistics, 32(2), 407–499. — L'article qui a introduit l'algorithme LARS, dont dérive directement la façon dont `glmnet` calcule le chemin de régularisation du Lasso.
+-   Package : `{lars}` (Trevor Hastie), toujours maintenu sur CRAN — le même jeu de données est aussi mirroré, de façon indépendante, dans au moins 5 autres packages actifs (`{l2boost}`, `{hsstan}`, `{islasso}`, `{bcaboot}`, `{BayesBridge}`), ce qui le rend particulièrement robuste dans la durée.
+-   442 patients diabétiques, réponse `y` = mesure quantitative de la progression de la maladie un an après l'inclusion. Prédicteurs `x2` : les 10 mesures de base (âge, sexe, IMC, pression artérielle, 6 mesures sanguines) plus leurs termes quadratiques et d'interaction, soit 64 variables au total.
+:::
+
+```{r diab-load}
+library(lars)
+# package = "lars" explicite : plusieurs packages définissent un objet nommé
+# "diabetes" (ex. {mclust}) -- sans le préciser, data() peut charger le
+# mauvais jeu de données selon l'ordre de chargement des packages en session.
+data(diabetes, package = "lars")
+
+# diabetes$x2 est une matrice encapsulée en objet AsIs dans le data.frame
+# d'origine. as.data.frame() sur un AsIs ne l'"étale" PAS en colonnes
+# séparées -- il le garde comme une seule colonne contenant la matrice
+# entière (une "matrix-column"). model.matrix() sait développer cette
+# colonne en interne (d'où le bon compte de 64 variables dans fit_diab
+# malgré une apparence de 3 colonnes), mais des fonctions comme
+# check_collinearity_lasso(), qui listent les noms de colonnes directement,
+# n'y verraient qu'UN SEUL nom. unclass() retire l'attribut AsIs avant
+# as.data.frame(), pour forcer le véritable étalement en 64 colonnes.
+diabetes_data <- as.data.frame(unclass(diabetes$x2))
+# Garde-fou : force des noms de colonnes valides et uniques (make.names())
+# avant toute utilisation en aval -- un nom vide, dupliqué ou syntaxiquement
+# problématique dans la matrice d'origine se propagerait sinon silencieusement
+# jusqu'à faire échouer reformulate()/str2lang() bien plus loin dans le
+# document (cf. build_reduced_formula() dans le toolkit).
+colnames(diabetes_data) <- make.names(colnames(diabetes_data), unique = TRUE)
+diabetes_data <- diabetes_data %>%
+  dplyr::mutate(
+    y         = diabetes$y,
+    PatientID = as.character(dplyr::row_number())
+  )
+
+dim(diabetes_data)
+```
+
+```{r}
+# =============================================================================
+# 1. DIABETES (lars::diabetes) — dictionnaire écrit à la main, fiable
+# =============================================================================
+# Les 10 variables de base sont bien documentées (Efron et al., 2004). Les
+# 54 termes quadratiques/interactions sont générés AUTOMATIQUEMENT à partir
+# de ces 10 labels, pour ne jamais risquer un désaccord avec les vrais noms
+# de colonnes (qui dépendent de la sanitisation make.names() appliquée au
+# chargement : "age^2" -> "age.2", "age:sex" -> "age.sex", etc.).
+
+labels_diabetes_base <- c(
+  age = "Âge",
+  sex = "Sexe",
+  bmi = "IMC",
+  map = "Pression artérielle",
+  tc  = "Cholestérol total",
+  ldl = "LDL",
+  hdl = "HDL",
+  tch = "Cholestérol/HDL",
+  ltg = "Triglycérides (log)",
+  glu = "Glycémie"
+)
+
+labels_diabetes <- setNames(
+  vapply(colnames(diabetes_data), function(col) {
+    if (col %in% names(labels_diabetes_base)) return(labels_diabetes_base[[col]])
+    parts <- strsplit(col, "\\.")[[1]]
+    if (length(parts) == 2 && parts[2] == "2" && parts[1] %in% names(labels_diabetes_base)) {
+      return(paste0(labels_diabetes_base[[parts[1]]], "\u00b2"))
+    }
+    if (length(parts) == 2 && all(parts %in% names(labels_diabetes_base))) {
+      return(paste0(labels_diabetes_base[[parts[1]]], " \u00d7 ", labels_diabetes_base[[parts[2]]]))
+    }
+    col  # repli : garde le nom brut si le motif n'est pas reconnu
+  }, character(1)),
+  colnames(diabetes_data)
+)
+
+# Aperçu
+head(labels_diabetes, 15)
+```
+
+### Ajustement
+
+::: {.callout-tip title="📘 Comment ça marche"}
+`fit_lasso_repeated_cv(data, formula, id_col, v, repeats, seed)` découpe `data` en `v` blocs (*folds*), répète l'opération `repeats` fois, et ajuste un Lasso indépendant sur chacun des `v × repeats` folds. Un modèle "final", ajusté sur l'ensemble des données, est conservé à part pour les diagnostics qui ne dépendent pas d'un fold particulier.
+:::
+
+```{r diab-fit}
+fit_diab <- fit_lasso_repeated_cv(
+  data    = diabetes_data,
+  formula = y ~ .,
+  id_col  = "PatientID",
+  v = 5, repeats = 20, seed = 42
+)
+
+print(fit_diab)
+```
+
+Table complète des coefficients retenus, exportable en CSV/Excel :
+
+```{r diab-coef-table}
+export_table(coef_table_lasso(fit_diab), caption = "Variables retenues -- modèle final (diabète)")
+```
+
+### Stabilité de la pénalisation : `check_lambda_range_lasso()` + `plot_lambda_path_lasso()`
+
+::: {.callout-tip title="📘 Comment ça marche, et pourquoi tout de suite après l'ajustement"}
+`cv.glmnet()` teste une grille de valeurs de $\lambda$ et retient celle qui minimise l'erreur de validation croisée interne. Un `lambda.min` au bord de cette grille signale qu'elle est mal calée — le vrai optimum pourrait être en dehors de ce qui a été testé. C'est le tout premier réflexe à avoir après un ajustement : si la grille doit être élargie (argument `lambda` de `fit_lasso_repeated_cv()`), c'est ici qu'on le décide, **avant** d'aller lire performance ou qualité de prédiction — sans quoi ces lectures pourraient porter sur un modèle mal calibré dès le départ.
+:::
+
+```{r diab-lambda}
+#| fig-width: 8
+#| fig-height: 6
+
+check_lambda_range_lasso(fit_diab)
+plot_lambda_path_lasso(fit_diab)
+plot_lambda_stability(fit_diab)
+```
+
+### Performance
+
+::: {.callout-note title="📘 Théorie : R², RMSE, MAE, MSE"}
+$$R^2 = 1 - \frac{\text{SSE}}{\text{SST}} \qquad \text{RMSE} = \sqrt{\text{MSE}} \qquad \text{MSE} = \frac{1}{n}\sum_i (y_i-\hat y_i)^2 \qquad \text{MAE} = \frac{1}{n}\sum_i |y_i-\hat y_i|$$
+
+Calculés de 2 façons complémentaires : **poolée** (tous les résidus des `v × repeats` folds regroupés) et **par fold** (calculée fold par fold puis résumée — révèle la variabilité invisible dans la version poolée).
+:::
+
+```{r diab-perf}
+perf_diab <- model_performance.lasso_cv_fit(fit_diab)
+print(perf_diab)
+```
+
+::: {.callout-tip title="📘 5 lectures possibles de la qualité de prédiction"}
+`plot_prediction_quality(fit, mode = ...)` propose 5 vues, à ne pas confondre :
+
+-   **`"pooled"`** (défaut) : trait fin bleu = étendue min-max des prédictions de la CV (`v × repeats` folds) pour cette valeur réelle ; point **orange** = prédiction du modèle **FINAL** (celui ajusté sur 100% des données) -- **pas** la moyenne des prédictions de CV.
+-   **`"pooled_mean"`** : EXACTEMENT le même trait bleu (étendue de la CV), mais le point est cette fois **bleu** et représente la **moyenne** des prédictions de CV pour cette valeur réelle -- l'ancien comportement par défaut, conservé comme lecture alternative honnête (le point reste "dans la famille" des modèles de CV, contrairement au point orange de `"pooled"`).
+-   **`"final"`** : prédictions du modèle final seules, sans étendue de CV en regard, sur l'ensemble des données. ⚠️ Ajusté sur ces mêmes données : optimiste par construction — utile pour inspecter l'ajustement du modèle final isolément, pas pour rapporter une performance.
+-   **`"overlay"`** : superpose tous les points poolés BRUTS (bleu, non résumés par valeur réelle) et les prédictions du modèle final (orange, premier plan) — plus granulaire que `"pooled"`/`"pooled_mean"`, qui résument déjà l'étendue par un trait.
+-   **`"panel"`** : assemble `"final"`, `"pooled_mean"` et `"pooled"` côte à côte en un seul coup d'oeil -- qualité de l'**entraînement** (optimiste) → qualité **moyenne honnête** de la CV → qualité du modèle **optimal avec sa variabilité de CV** en repère.
+:::
+
+::: {.callout-important title="⚠️ Le point orange peut tomber HORS du trait bleu -- c'est normal"}
+En mode `"pooled"`, le trait bleu couvre l'étendue des prédictions produites par les \~100 modèles de la CV répétée, chacun ajusté sur seulement une partie des données (\~80% par fold). Le point orange, lui, vient d'un modèle **différent** : le modèle final, ajusté sur 100% des données. Rien ne garantit mathématiquement que sa prédiction tombe dans l'étendue des modèles de CV -- et c'est même **attendu aux valeurs extrêmes** de la plage de Y : un individu isolé loin du gros de la distribution (ex. le point le plus à gauche de votre graphique) est souvent absent, ou très peu représenté, dans plusieurs des sous-ensembles d'entraînement de la CV, ce qui rend ces modèles-là particulièrement incertains sur cette zone (extrapolation) ; le modèle final, lui, a vu ce point (ou ses voisins immédiats) et peut donc s'ajuster différemment. Un point orange qui sort régulièrement du trait bleu, concentré sur les valeurs extrêmes, est donc un signal cohérent plutôt qu'une anomalie -- s'il apparaît aussi au **centre** de la distribution (là où les données sont denses et où tous les folds voient des points similaires), creusez davantage (formule instable, `lambda` mal calé, etc.).
+:::
+
+```{r diab-pred-quality-panel}
+#| fig-width: 9
+#| fig-height: 9
+
+plot_prediction_quality(fit_diab, mode = "panel")
+```
+
+::: {.callout-note collapse="true" title="🔍 Voir aussi : les 4 vues individuelles (pooled, pooled_mean, final, overlay)"}
+`"panel"` ci-dessus résume l'essentiel pour un usage courant. Les 4 vues qui le composent (plus `"overlay"`, non incluse dans `"panel"`) restent disponibles individuellement, en plus grand, pour une inspection détaillée :
+
+```{r diab-pred-quality-detail}
+#| fig-width: 8
+#| fig-height: 6
+
+plot_prediction_quality(fit_diab, mode = "pooled")
+plot_prediction_quality(fit_diab, mode = "pooled_mean")
+plot_prediction_quality(fit_diab, mode = "final")
+plot_prediction_quality(fit_diab, mode = "overlay")
+```
+:::
+
+### Multicolinéarité : le VIF est calculable ici
+
+::: {.callout-important title="📘 Contraste avec le régime p >> n (section A.2)"}
+Avec 442 observations pour 64 prédicteurs, la matrice de design est de rang plein : le VIF est parfaitement calculable, contrairement au régime $p \gg n$ de la section suivante. Les termes d'interaction/quadratiques étant par construction dérivés des 10 variables de base, on s'attend à voir certains VIF nettement élevés ici — un cas d'école pour illustrer la fonction.
+
+**Référence :** Marquardt, D. W. (1970). *Generalized Inverses, Ridge Regression, Biased Linear Estimation, and Nonlinear Estimation.* Technometrics, 12(3), 591–612.
+:::
+
+```{r diab-vif}
+#| fig-width: 16
+#| fig-height: 10
+
+# VIF sur les 64 variables candidates
+vif_diab <- check_collinearity_lasso(diabetes_data, y ~ ., id_col = "PatientID")
+# print(vif_diab)
+
+vif_diab_selection <- check_collinearity_lasso(diabetes_data, y ~ ., id_col = "PatientID",
+                                                fit = fit_diab, selected_only = TRUE)
+# print(vif_diab_selection)
+
+
+plot_collinearity(vif_diab, labels = labels_diabetes) | plot_collinearity(vif_diab_selection, labels = labels_diabetes)
+```
+
+::: {.callout-tip title="📘 VIF restreint aux variables retenues"}
+`selected_only = TRUE` recalcule le VIF en ne régressant chaque variable retenue que sur les AUTRES variables retenues (pas un simple filtre visuel après coup) — la question pertinente une fois le modèle final choisi : *les variables qui ont survécu à la sélection sont-elles elles-mêmes corrélées entre elles ?*
+:::
+
+### Importance des variables
+
+```{r diab-importance}
+#| fig-width: 12
+#| fig-height: 8
+
+plot_coefficient_importance(fit_diab, labels = labels_diabetes)
+```
+
+::: {.callout-note collapse="true" title="🔍 Voir aussi : normalité, homoscédasticité, individus à erreur systématique (en détail)"}
+Ces 3 diagnostics sont déjà inclus, en plus compact, dans le panel `check_model_lasso()` ci-dessous -- les afficher ici en plus grand permet une inspection plus fine si besoin.
+
+**Théorie :**
+
+-   Shapiro, S. S., & Wilk, M. B. (1965). *An analysis of variance test for normality (complete samples).* Biometrika, 52(3/4), 591–611.
+-   Anderson, T. W., & Darling, D. A. (1952). *Asymptotic theory of certain "goodness of fit" criteria based on stochastic processes.* Annals of Mathematical Statistics, 23(2), 193–212.
+-   Breusch, T. S., & Pagan, A. R. (1979). *A simple test for heteroscedasticity and random coefficient variation.* Econometrica, 47(5), 1287–1294.
+
+```{r diab-normality-hetero}
+#| fig-width: 7
+#| fig-height: 6
+
+norm_diab   <- check_normality_lasso(fit_diab)
+hetero_diab <- check_heteroscedasticity_lasso(fit_diab)
+print(norm_diab)
+plot(norm_diab)
+print(hetero_diab)
+plot(hetero_diab)
+```
+
+```{r diab-outliers}
+#| fig-width: 10
+#| fig-height: 6
+
+outliers_diab <- check_outliers_lasso(fit_diab)
+plot(outliers_diab)
+```
+:::
+
+### Vue d'ensemble : `check_model_lasso()`
+
+```{r diab-check-model}
+#| fig-width: 15
+#| fig-height: 17
+
+check_model_lasso(fit_diab, labels = labels_diabetes)
+```
+
+### Comparer 2 modèles : `compare_models_lasso()`
+
+::: {.callout-note title="📘 Théorie : comparaison appariée sur les mêmes folds, et grille de métriques"}
+Comparer 2 modèles ajustés sur des folds différents introduirait une source de variance sans rapport avec la vraie différence de performance. `compare_models_lasso()` force le partage des mêmes folds, puis compare via un test **apparié** (Wilcoxon pour 2 modèles, Friedman pour 3-4). Les 4 métriques (R², RMSE, MAE, MSE) sont affichées en grille carrée 2×2.
+
+-   Wilcoxon, F. (1945). *Individual comparisons by ranking methods.* Biometrics Bulletin, 1(6), 80–83.
+:::
+
+```{r diab-compare}
+#| fig-width: 14
+#| fig-height: 12
+
+
+colonnes_candidates <- setdiff(colnames(diabetes_data), c("y", "PatientID"))
+variables_diab <- sample(colonnes_candidates, size = 20)
+formule_reduite_diab <- build_reduced_formula(variables_diab, response = "y")
+
+comp_diab <- compare_models_lasso(
+  fits = list(
+    fit_diab,
+    fit_lasso_repeated_cv(diabetes_data, formule_reduite_diab, id_col = "PatientID",
+                                      cv_repeats = fit_diab$cv_repeats)
+  ),
+  labels   = c("Lasso complet (64 var.)", sprintf("%d variables sélectionnées au hasard", length(variables_diab)))
+)
+
+comp_diab$plot
+comp_diab$global_test
+export_table(comp_diab$variables_summary, caption = "Variables en entrée / en sortie -- diabète")
+```
+
+------------------------------------------------------------------------
+
+## A.2 : Régime $p \gg n$ : inférence de réseau de régulation génique
+
+::: {.callout-note title="📘 Théorie : prédire un gène à partir des autres"}
+Prédire l'expression d'un gène à partir de l'expression de tous les autres est une technique réelle d'**inférence de réseaux de régulation génique** : les gènes retenus par le Lasso sont interprétés comme des régulateurs candidats du gène cible.
+
+-   Haury, A.-C., Mordelet, F., Vera-Licona, P., & Vert, J.-P. (2012). *TIGRESS: Trustful Inference of Gene REgulation using Stability Selection.* BMC Systems Biology, 6, 145.
+-   Meinshausen, N., & Bühlmann, P. (2010). *Stability Selection.* JRSS B, 72(4), 417–473. — La méthode que `plot_coefficient_importance()` illustre directement.
+:::
+
+::: {.callout-tip title="📚 Origine des données"}
+-   Khan, J., Wei, J. S., Ringnér, M., Saal, L. H., Ladanyi, M., Westermann, F., Berthold, F., Schwab, M., Antonescu, C. R., Peterson, C., & Meltzer, P. S. (2001). *Classification and diagnostic prediction of cancers using gene expression profiling and artificial neural networks.* Nature Medicine, 7(6), 673–679.
+-   Package : `{ISLR2}` (James, Witten, Hastie & Tibshirani) — compagnon du manuel *An Introduction to Statistical Learning*.
+:::
+
+```{r khan-load}
+library(ISLR2)
+data(Khan)
+
+# Combine train + test (fournis séparément à l'origine pour reproduire un
+# protocole fixe) : la validation croisée répétée de ce tutoriel remplace de
+# toute façon ce split unique par un plan d'évaluation plus robuste.
+X_khan <- rbind(Khan$xtrain, Khan$xtest)
+Y_khan <- c(Khan$ytrain, Khan$ytest)
+
+dim(X_khan)
+table(Y_khan)
+```
+
+```{r khan-gauss-prepa}
+khan_gauss <- as.data.frame(X_khan) %>%
+  dplyr::rename(expression_cible = V1) %>%
+  dplyr::mutate(SampleID = as.character(dplyr::row_number()))
+
+dim(khan_gauss)
+```
+
+```{r}
+# --- Khan (gènes) : pas de nom biologique disponible, juste "Gène N" ---
+labels_khan_gauss <- setNames(
+  ifelse(colnames(khan_gauss) == "expression_cible", "Expression cible",
+         paste0("Gène ", sub("^V", "", colnames(khan_gauss)))),
+  colnames(khan_gauss)
+)
+
+
+```
+
+Le gène `V1` (choix arbitraire, à but pédagogique) devient la variable à prédire ; les 2307 gènes restants sont les prédicteurs candidats — **83 observations pour 2307 prédicteurs**, un contraste net avec le régime $p < n$ de la section A.1.
+
+### Ajustement
+
+```{r khan-gauss-fit}
+#| cache: true
+
+fit_khan_gauss <- fit_lasso_repeated_cv(
+  data    = khan_gauss,
+  formula = expression_cible ~ .,
+  id_col  = "SampleID",
+  v = 5, repeats = 20, seed = 42
+)
+
+print(fit_khan_gauss)
+```
+
+```{r khan-gauss-coef-table}
+export_table(coef_table_lasso(fit_khan_gauss), caption = "Gènes retenus -- modèle final (inférence de réseau)")
+```
+
+### Stabilité de la pénalisation
+
+*(cf. théorie section A.1 — vérifiée juste après l'ajustement, avant de lire performance/qualité de prédiction)*
+
+```{r khan-gauss-lambda}
+#| fig-width: 8
+#| fig-height: 6
+
+check_lambda_range_lasso(fit_khan_gauss)
+plot_lambda_path_lasso(fit_khan_gauss)
+```
+
+### Performance et qualité de prédiction
+
+```{r khan-gauss-perf}
+perf_khan_gauss <- model_performance.lasso_cv_fit(fit_khan_gauss)
+print(perf_khan_gauss)
+```
+
+```{r khan-gauss-pred-quality}
+#| fig-width: 8
+#| fig-height: 6
+
+plot_prediction_quality(fit_khan_gauss)
+# mode = "final" / "overlay" également disponibles ici (cf. section A.1)
+```
+
+```{r khan-gauss-pred-quality-panel}
+#| fig-width: 9
+#| fig-height: 9
+
+plot_prediction_quality(fit_khan_gauss, mode = "panel")
+```
+
+### Multicolinéarité : non calculable sur l'ensemble des candidats, mais l'est en se restreignant aux gènes sélectionnés
+
+::: {.callout-important title="📘 Pourquoi le VIF n'est PAS calculable en régime p >> n"}
+Le VIF exige un nombre d'observations supérieur au nombre de prédicteurs — condition violée ici (83 observations, 2307 prédicteurs). C'est mathématiquement inévitable : la matrice de design $X$ n'est pas de rang plein. `check_collinearity_lasso()` détecte ce cas et l'indique explicitement, plutôt que de laisser `car::vif()` échouer avec un message obscur — à comparer avec le résultat parfaitement normal obtenu en section A.1.
+:::
+
+```{r khan-gauss-vif}
+#| fig-width: 12
+#| fig-height: 14
+
+vif_khan_gauss <- check_collinearity_lasso(khan_gauss, expression_cible ~ ., id_col = "SampleID")
+# print(vif_khan_gauss)
+
+
+vif_khan_gauss_selection <- check_collinearity_lasso(khan_gauss, expression_cible ~ ., id_col = "SampleID",
+                                                      fit = fit_khan_gauss, selected_only = TRUE)
+# print(vif_khan_gauss_selection)
+
+
+plot_collinearity(vif_khan_gauss, labels = labels_khan_gauss) | plot_collinearity(vif_khan_gauss_selection, labels = labels_khan_gauss)
+```
+
+::: {.callout-tip title="📘 Restreint aux gènes sélectionnés : de nouveau calculable"}
+Le nombre de gènes retenus par le Lasso est généralement très inférieur à 83 : en s'y restreignant (`selected_only = TRUE`), on repasse en régime $p < n$, et le VIF redevient calculable — un effet de bord utile de cette option.
+:::
+
+### Importance des variables
+
+::: {.callout-tip title="📘 En grande dimension"}
+Sur 2307 gènes candidats, seule une poignée sera jamais sélectionnée : `plot_coefficient_importance()` ne montre que les variables retenues au moins une fois (paramètre `top_n`, défaut 30), pour rester lisible quel que soit `p`.
+:::
+
+```{r khan-gauss-importance}
+#| fig-width: 11
+#| fig-height: 7
+
+plot_coefficient_importance(fit_khan_gauss, labels = labels_khan_gauss)
+```
+
+::: {.callout-note collapse="true" title="🔍 Voir aussi : normalité, homoscédasticité, individus à erreur systématique (en détail)"}
+Mêmes tests qu'en A.1 (théorie déjà présentée là-bas), déjà inclus en plus compact dans `check_model_lasso()` ci-dessous -- résultats propres à ce jeu de données :
+
+```{r khan-gauss-diagnostics}
+#| fig-width: 7
+#| fig-height: 6
+
+plot(check_normality_lasso(fit_khan_gauss))
+plot(check_heteroscedasticity_lasso(fit_khan_gauss))
+plot(check_outliers_lasso(fit_khan_gauss))
+```
+:::
+
+### Vue d'ensemble
+
+```{r khan-gauss-check-model}
+#| fig-width: 13
+#| fig-height: 17
+
+check_model_lasso(fit_khan_gauss, labels = labels_khan_gauss)
+```
+
+### Comparer 2 modèles
+
+```{r khan-gauss-compare}
+#| fig-width: 14
+#| fig-height: 12
+#| cache: true
+
+colonnes_candidates <- setdiff(colnames(khan_gauss), c("expression_cible", "SampleID"))
+genes_retenus <- sample(colonnes_candidates, size = 100)
+formule_reduite <- build_reduced_formula(genes_retenus, response = "expression_cible")
+
+comp_khan_gauss <- compare_models_lasso(
+  fits = list(
+    fit_khan_gauss,
+    fit_lasso_repeated_cv(khan_gauss, formule_reduite, id_col = "SampleID",
+                                      cv_repeats = fit_khan_gauss$cv_repeats)
+  ),
+  labels   = c("Lasso complet (64 var.)", sprintf("%d variables sélectionnées au hasard", length(genes_retenus)))
+)
+
+comp_khan_gauss$plot
+comp_khan_gauss$global_test
+export_table(comp_khan_gauss$variables_summary, caption = "Variables en entrée / en sortie -- inférence de réseau génique")
+```
+
+------------------------------------------------------------------------
+
+# Partie B : Régression logistique
+
+## B.1 : Régime $p < n$ : diagnostic de la maladie d'Alzheimer à partir de biomarqueurs du LCR
+
+::: {.callout-tip title="📚 Origine des données"}
+-   Craig-Schapiro, R., Kuhn, M., Xiong, C., Pickering, E. H., Liu, J., Misko, T. P., Perrin, R. J., et al. (2011). *Multiplexed immunoassay panel identifies novel CSF biomarkers for Alzheimer's disease diagnosis and prognosis.* PLOS ONE, 6(4), e18850.
+-   Package : `{AppliedPredictiveModeling}` (Max Kuhn) — même package que la section A.1.
+-   Panel de biomarqueurs mesurés dans le liquide céphalo-rachidien (LCR), plus données démographiques et génotype de l'Apolipoprotéine E, pour distinguer patients atteints ("Impaired") et témoins ("Control").
+:::
+
+```{r alz-load}
+library(AppliedPredictiveModeling)
+data(AlzheimerDisease)
+
+# 'predictors' (data.frame) et 'diagnosis' (facteur) sont chargés comme 2
+# objets distincts par data(AlzheimerDisease) -- on les recombine ici.
+alzheimer_data <- predictors %>%
+  dplyr::mutate(
+    diagnosis = diagnosis,
+    PatientID = as.character(dplyr::row_number())
+  )
+
+dim(alzheimer_data)
+table(alzheimer_data$diagnosis)
+```
+
+```{r}
+labels_alzheimer <- c(
+  ACE_CD143_Angiotensin_Converti   = "ACE (CD143)",
+  ACTH_Adrenocorticotropic_Hormon  = "ACTH",
+  AXL                              = "AXL",
+  Adiponectin                      = "Adiponectine",
+  Alpha_1_Antichymotrypsin         = "\u03b11-Antichymotrypsine",
+  Alpha_1_Antitrypsin              = "\u03b11-Antitrypsine",
+  Alpha_1_Microglobulin            = "\u03b11-Microglobuline",
+  Alpha_2_Macroglobulin            = "\u03b12-Macroglobuline",
+  Angiopoietin_2_ANG_2             = "ANG-2",
+  Angiotensinogen                  = "Angiotensinogène",
+  Apolipoprotein_A_IV              = "ApoA-IV",
+  Apolipoprotein_A1                = "ApoA1",
+  Apolipoprotein_A2                = "ApoA2",
+  Apolipoprotein_B                 = "ApoB",
+  Apolipoprotein_CI                = "ApoC1",
+  Apolipoprotein_CIII              = "ApoC3",
+  Apolipoprotein_D                 = "ApoD",
+  Apolipoprotein_E                 = "ApoE",
+  Apolipoprotein_H                 = "ApoH",
+  B_Lymphocyte_Chemoattractant_BL  = "BLC (CXCL13)",
+  BMP_6                            = "BMP-6",
+  Beta_2_Microglobulin             = "\u03b22-Microglobuline",
+  Betacellulin                     = "Bétacelluline",
+  C_Reactive_Protein               = "CRP",
+  CD40                             = "CD40",
+  CD5L                             = "CD5L",
+  Calbindin                        = "Calbindine",
+  Calcitonin                       = "Calcitonine",
+  CgA                              = "CgA",
+  Clusterin_Apo_J                  = "ApoJ (Clustérine)",
+  Complement_3                     = "C3",
+  Complement_Factor_H              = "CFH",
+  Connective_Tissue_Growth_Factor  = "CTGF",
+  Cortisol                         = "Cortisol",
+  Creatine_Kinase_MB               = "CK-MB",
+  Cystatin_C                       = "Cystatine C",
+  EGF_R                            = "EGFR",
+  EN_RAGE                          = "EN-RAGE",
+  ENA_78                           = "ENA-78",
+  Eotaxin_3                        = "Éotaxine-3",
+  FAS                              = "FAS",
+  FSH_Follicle_Stimulation_Hormon  = "FSH",
+  Fas_Ligand                       = "FasL",
+  Fatty_Acid_Binding_Protein       = "FABP",
+  Ferritin                         = "Ferritine",
+  Fetuin_A                         = "Fétuine A",
+  Fibrinogen                       = "Fibrinogène",
+  GRO_alpha                        = "GRO-\u03b1",
+  Gamma_Interferon_induced_Monokin = "MIG (CXCL9)",
+  Glutathione_S_Transferase_alpha  = "GST-\u03b1",
+  HB_EGF                           = "HB-EGF",
+  HCC_4                            = "HCC-4",
+  Hepatocyte_Growth_Factor_HGF     = "HGF",
+  I_309                            = "I-309",
+  ICAM_1                           = "ICAM-1",
+  IGF_BP_2                         = "IGFBP-2",
+  IL_11                            = "IL-11",
+  IL_13                            = "IL-13",
+  IL_16                            = "IL-16",
+  IL_17E                           = "IL-17E",
+  IL_1alpha                        = "IL-1\u03b1",
+  IL_3                             = "IL-3",
+  IL_4                             = "IL-4",
+  IL_5                             = "IL-5",
+  IL_6                             = "IL-6",
+  IL_6_Receptor                    = "Récepteur IL-6",
+  IL_7                             = "IL-7",
+  IL_8                             = "IL-8",
+  IP_10_Inducible_Protein_10       = "IP-10",
+  IgA                              = "IgA",
+  Insulin                          = "Insuline",
+  Kidney_Injury_Molecule_1_KIM_1   = "KIM-1",
+  LOX_1                            = "LOX-1",
+  Leptin                           = "Leptine",
+  Lipoprotein_a                    = "Lp(a)",
+  MCP_1                            = "MCP-1",
+  MCP_2                            = "MCP-2",
+  MIF                              = "MIF",
+  MIP_1alpha                       = "MIP-1\u03b1",
+  MIP_1beta                        = "MIP-1\u03b2",
+  MMP_2                            = "MMP-2",
+  MMP_3                            = "MMP-3",
+  MMP10                            = "MMP-10",
+  MMP7                             = "MMP-7",
+  Myoglobin                        = "Myoglobine",
+  NT_proBNP                        = "NT-proBNP",
+  NrCAM                            = "NrCAM",
+  Osteopontin                      = "Ostéopontine",
+  PAI_1                            = "PAI-1",
+  PAPP_A                           = "PAPP-A",
+  PLGF                             = "PlGF",
+  PYY                              = "PYY",
+  Pancreatic_polypeptide           = "PP pancréatique",
+  Prolactin                        = "Prolactine",
+  Prostatic_Acid_Phosphatase       = "PAP",
+  Protein_S                        = "Protéine S",
+  Pulmonary_and_Activation_Regulat = "PARC (CCL18)",
+  RANTES                           = "RANTES",
+  Resistin                         = "Résistine",
+  S100b                            = "S100B",
+  SGOT                             = "SGOT",
+  SHBG                             = "SHBG",
+  SOD                              = "SOD",
+  Serum_Amyloid_P                  = "SAP",
+  Sortilin                         = "Sortiline",
+  Stem_Cell_Factor                 = "SCF",
+  TGF_alpha                        = "TGF-\u03b1",
+  TIMP_1                           = "TIMP-1",
+  TNF_RII                          = "TNF-RII",
+  TRAIL_R3                         = "TRAIL-R3",
+  TTR_prealbumin                   = "TTR (préalbumine)",
+  Tamm_Horsfall_Protein_THP        = "THP",
+  Thrombomodulin                   = "Thrombomoduline",
+  Thrombopoietin                   = "Thrombopoïétine",
+  Thymus_Expressed_Chemokine_TECK  = "TECK (CCL25)",
+  Thyroid_Stimulating_Hormone      = "TSH",
+  Thyroxine_Binding_Globulin       = "TBG",
+  Tissue_Factor                    = "Facteur tissulaire",
+  Transferrin                      = "Transferrine",
+  Trefoil_Factor_3_TFF3            = "TFF3",
+  VCAM_1                           = "VCAM-1",
+  VEGF                             = "VEGF",
+  Vitronectin                      = "Vitronectine",
+  von_Willebrand_Factor            = "vWF",
+  age                              = "Âge",
+  tau                              = "Tau",
+  p_tau                            = "P-Tau",
+  Ab_42                            = "A\u03b242",
+  male                             = "Sexe (H)"
+)
+
+# Vérification : toutes les colonnes réelles ont-elles bien un label ?
+manquants <- setdiff(colnames(alzheimer_data), names(labels_alzheimer))
+if (length(manquants) > 0) {
+  message("Colonnes sans label (garderont leur nom brut) : ", paste(manquants, collapse = ", "))
+}
+
+```
+
+**333 patients pour \~130 biomarqueurs/covariables** : $p < n$, mais $p$ largement supérieur aux exemples "classiques" à quelques variables — assez pour que la sélection de variables reste réellement informative.
+
+### Ajustement : `family = "binomial"`
+
+::: {.callout-note title="📘 Théorie : régression logistique et log-odds"}
+Pour une réponse binaire $Y \in \{0,1\}$ :
+
+$$\log\left(\frac{P(Y=1)}{1-P(Y=1)}\right) = \beta_0 + \sum_j \beta_j x_j$$
+
+**Références :**
+
+-   Hosmer, D. W., Lemeshow, S., & Sturdivant, R. X. (2013). *Applied Logistic Regression* (3ᵉ éd.). Wiley.
+-   Friedman, Hastie & Tibshirani (2010), déjà cité — `glmnet` implémente `family = "binomial"` avec la même pénalisation par descente de coordonnées.
+:::
+
+```{r alz-fit}
+fit_alz <- fit_lasso_repeated_cv(
+  data    = alzheimer_data,
+  formula = diagnosis ~ .,
+  id_col  = "PatientID",
+  family  = "binomial",
+  v = 5, repeats = 20, seed = 42
+)
+
+print(fit_alz)
+```
+
+`fit_alz$positive_class` indique quel niveau de `diagnosis` est traité comme l'événement "1".
+
+```{r alz-coef-table}
+export_table(coef_table_lasso(fit_alz), caption = "Biomarqueurs retenus -- modèle final (Alzheimer)")
+```
+
+### Stabilité de la pénalisation
+
+*(vérifiée juste après l'ajustement, avant de lire performance/qualité de prédiction — cf. théorie section A.1)*
+
+```{r alz-lambda}
+#| fig-width: 8
+#| fig-height: 6
+
+check_lambda_range_lasso(fit_alz)
+plot_lambda_path_lasso(fit_alz)
+```
+
+### Performance : Accuracy, AUC, Brier
+
+::: {.callout-note title="📘 Théorie : évaluer un classifieur binaire"}
+**Matrice de confusion :** Altman, D. G., & Bland, J. M. (1994). *Diagnostic tests 1: sensitivity and specificity.* BMJ, 308(6943), 1552.
+
+**AUC :** Hanley, J. A., & McNeil, B. J. (1982). *The meaning and use of the area under a receiver operating characteristic (ROC) curve.* Radiology, 143(1), 29–36. — Calculée ici par la formule de Mann-Whitney (sans dépendance à `{pROC}`).
+
+**Brier score :** Brier, G. W. (1950). *Verification of forecasts expressed in terms of probability.* Monthly Weather Review, 78(1), 1–3.
+:::
+
+```{r alz-perf}
+perf_alz <- model_performance.lasso_cv_fit(fit_alz)
+print(perf_alz)
+```
+
+```{r alz-pred-quality}
+#| fig-width: 8
+#| fig-height: 6
+
+plot_prediction_quality(fit_alz)
+# mode n'a pas d'effet pour family="binomial" (cf. section A.1) : la
+# distribution des probabilités par classe reste la seule vue pertinente.
+```
+
+### Multicolinéarité : le VIF est calculable ici
+
+::: {.callout-important title="📘 Contraste avec le régime p >> n (section B.2)"}
+Avec 333 patients pour \~130 prédicteurs, le VIF est calculable normalement — contrairement au régime $p \gg n$ de la section B.2. Certains biomarqueurs du panel, mesurant des voies biologiques proches, peuvent néanmoins afficher un VIF modéré à élevé.
+:::
+
+```{r alz-vif}
+#| fig-width: 9
+#| fig-height: 16
+
+vif_alz <- check_collinearity_lasso(alzheimer_data, diagnosis ~ ., id_col = "PatientID")
+print(vif_alz)
+plot_collinearity(vif_alz, labels = labels_alzheimer)
+```
+
+::: {.callout-tip title="📘 VIF restreint aux biomarqueurs retenus"}
+Recalcul du VIF en ne régressant chaque biomarqueur retenu que sur les autres biomarqueurs retenus -- nettement plus lisible que le panel complet ci-dessus.
+:::
+
+```{r alz-vif-selected}
+#| fig-width: 7
+#| fig-height: 5
+
+vif_alz_selection <- check_collinearity_lasso(alzheimer_data, diagnosis ~ ., id_col = "PatientID",
+                                               fit = fit_alz, selected_only = TRUE)
+print(vif_alz_selection)
+plot_collinearity(vif_alz_selection, labels = labels_alzheimer)
+```
+
+### Importance des variables
+
+```{r alz-importance}
+#| fig-width: 10
+#| fig-height: 6
+
+plot_coefficient_importance(fit_alz, labels = labels_alzheimer)
+```
+
+::: {.callout-note collapse="true" title="🔍 Voir aussi : ROC, Précision-Rappel, calibration, matrice de confusion, outliers (en détail)"}
+ROC, calibration et matrice de confusion sont déjà inclus, en plus compact, dans le panel `check_model_lasso()` ci-dessous ; la courbe Précision-Rappel est un complément non inclus dans ce panel, utile en particulier si les classes sont déséquilibrées.
+
+**Théorie :**
+
+-   Saito, T., & Rehmsmeier, M. (2015). *The Precision-Recall Plot Is More Informative than the ROC Plot When Evaluating Binary Classifiers on Imbalanced Datasets.* PLOS ONE, 10(3), e0118432.
+-   Van Calster, B., Nieboer, D., Vergouwe, Y., De Cock, B., Pencina, M. J., & Steyerberg, E. W. (2016). *A calibration hierarchy for risk models was defined: from utopia to empirical data.* Journal of Clinical Epidemiology, 74, 167–176.
+
+```{r alz-roc-pr-calib-confusion}
+#| fig-width: 7
+#| fig-height: 6
+
+plot_roc_lasso(fit_alz)
+plot_precision_recall_lasso(fit_alz)
+plot_calibration_lasso(fit_alz)
+plot_confusion_matrix_lasso(fit_alz)
+```
+
+```{r alz-outliers}
+#| fig-width: 10
+#| fig-height: 6
+
+plot(check_outliers_lasso(fit_alz))
+```
+:::
+
+### Vue d'ensemble
+
+```{r alz-check-model}
+#| fig-width: 13
+#| fig-height: 17
+
+check_model_lasso(fit_alz, labels = labels_alzheimer)
+```
+
+### Comparer 2 modèles
+
+```{r alz-compare}
+#| fig-width: 14
+#| fig-height: 12
+
+# unique(VariableOriginale) : "Genotype" est un facteur a plusieurs niveaux --
+# le Lasso peut ne retenir qu'UN SEUL niveau (ex. "GenotypeE4E4"), un nom qui
+# n'existe pas comme colonne du data.frame source. VariableOriginale ramene
+# ce nom a "Genotype" (la variable entiere) pour que reformulate() reference
+# une colonne qui existe reellement -- au prix d'inclure TOUS les niveaux du
+# facteur dans le modele reduit des qu'un seul est selectionne (limite
+# inherente a la representation en formule R, pas du code specifique ici).
+# biomarqueurs_alz <- unique(coef_table_lasso(fit_alz)$VariableOriginale)
+colonnes_candidates <- setdiff(colnames(alzheimer_data), c("diagnosis", "PatientID"))
+biomarqueurs_alz <- sample(colonnes_candidates, size = 20)
+formule_reduite_alz <- build_reduced_formula(biomarqueurs_alz, response = "diagnosis")
+
+comp_alz <- compare_models_lasso(
+  fit = list(
+    fit_alz,
+    fit_lasso_repeated_cv(
+        data    = alzheimer_data,
+        formula = formule_reduite_alz,
+        id_col  = "PatientID",
+        family  = "binomial",
+        cv_repeats = fit_alz$cv_repeats
+      )
+    ),
+  labels   = c("Lasso complet (~130 var.)", sprintf("%d variables sélectionnées", length(biomarqueurs_alz)))
+)
+
+comp_alz$plot
+comp_alz$global_test
+export_table(comp_alz$variables_summary, caption = "Variables en entrée / en sortie -- Alzheimer")
+```
+
+------------------------------------------------------------------------
+
+## B.2 : Régime $p \gg n$ : diagnostic tumoral
+
+::: {.callout-tip title="📚 Origine des données"}
+Même jeu `ISLR2::Khan` que la section A.2 (Khan et al., 2001), utilisé ici dans son usage originel de classification.
+:::
+
+```{r khan-binom-prepa}
+top2 <- names(sort(table(Y_khan), decreasing = TRUE))[1:2]
+garder <- Y_khan %in% as.numeric(top2)
+
+khan_binom <- as.data.frame(X_khan[garder, ]) %>%
+  dplyr::mutate(
+    tumor_type = factor(Y_khan[garder]),
+    PatientID  = as.character(dplyr::row_number())
+  )
+
+dim(khan_binom)
+table(khan_binom$tumor_type)
+```
+
+```{r}
+labels_khan_binom <- setNames(
+  paste0("Gène ", sub("^V", "", colnames(khan_binom))),
+  colnames(khan_binom)
+)
+labels_khan_binom[["tumor_type"]] <- "Type de tumeur"
+```
+
+Les 2 types de tumeur les plus représentés parmi les 4 du jeu Khan sont sélectionnés dynamiquement (pas supposés à l'avance) — **2308 gènes candidats**, pour un nombre de patients nécessairement inférieur ou égal à 83.
+
+### Ajustement
+
+```{r khan-binom-fit}
+#| cache: true
+
+fit_khan_binom_1 <- fit_lasso_repeated_cv(
+  data    = khan_binom,
+  formula = tumor_type ~ .,
+  id_col  = "PatientID",
+  family  = "binomial",
+  v = 5, repeats = 20, seed = 42
+)
+
+print(fit_khan_binom_1)
+```
+
+`fit_khan_binom_1$positive_class` indique quel niveau de `tumor_type` est traité comme l'événement "1".
+
+::: {.callout-warning title="Petit échantillon : des folds peuvent être ignorés"}
+Selon l'équilibre des 2 classes retenues, un fold de test peut par hasard ne contenir qu'une seule classe — ce fold est alors ignoré (`fit_khan_binom_1$n_folds_valides` \< `fit_khan_binom_1$n_folds_total`), message affiché automatiquement à l'ajustement. C'est attendu et sans gravité.
+:::
+
+```{r khan-binom-coef-table}
+export_table(coef_table_lasso(fit_khan_binom_1), caption = "Gènes retenus -- modèle final (diagnostic tumoral)")
+```
+
+### Stabilité de la pénalisation
+
+*(vérifiée juste après l'ajustement — cf. théorie section A.1)*
+
+```{r khan-binom-lambda}
+#| fig-width: 8
+#| fig-height: 6
+
+check_lambda_range_lasso(fit_khan_binom_1)
+plot_lambda_path_lasso(fit_khan_binom_1)
+```
+
+```{r khan-binom-fit-2}
+#| cache: true
+
+fit_khan_binom <- fit_lasso_repeated_cv(
+  data    = khan_binom,
+  formula = tumor_type ~ .,
+  id_col  = "PatientID",
+  family  = "binomial",
+  lambda = exp(seq(-16, -10, length.out = 100)),
+  cv_repeats = fit_khan_binom_1$cv_repeats
+)
+
+print(fit_khan_binom)
+```
+
+```{r khan-binom-coef-table-2}
+export_table(coef_table_lasso(fit_khan_binom), caption = "Gènes retenus -- modèle final (diagnostic tumoral)")
+```
+
+```{r khan-binom-lambda-2}
+#| fig-width: 8
+#| fig-height: 6
+
+check_lambda_range_lasso(fit_khan_binom)
+plot_lambda_path_lasso(fit_khan_binom)
+```
+
+### Performance et qualité de prédiction
+
+```{r khan-binom-perf}
+perf_khan_binom <- model_performance.lasso_cv_fit(fit_khan_binom)
+print(perf_khan_binom)
+```
+
+```{r khan-binom-pred-quality}
+#| fig-width: 8
+#| fig-height: 6
+
+plot_prediction_quality(fit_khan_binom)
+```
+
+### Multicolinéarité : non calculable sur l'ensemble des candidats, mais l'est en se restreignant aux gènes sélectionnés
+
+```{r khan-binom-vif}
+#| fig-width: 6
+#| fig-height: 4
+
+vif_khan_binom <- check_collinearity_lasso(khan_binom, tumor_type ~ ., id_col = "PatientID")
+print(vif_khan_binom)
+plot_collinearity(vif_khan_binom, labels = labels_khan_binom)
+```
+
+```{r khan-binom-vif-selected}
+#| fig-width: 7
+#| fig-height: 5
+
+vif_khan_binom_selection <- check_collinearity_lasso(khan_binom, tumor_type ~ ., id_col = "PatientID",
+                                                      fit = fit_khan_binom, selected_only = TRUE)
+print(vif_khan_binom_selection)
+plot_collinearity(vif_khan_binom_selection, labels = labels_khan_binom)
+```
+
+### Importance des variables
+
+```{r khan-binom-importance}
+#| fig-width: 11
+#| fig-height: 6
+
+plot_coefficient_importance(fit_khan_binom, labels = labels_khan_binom)
+```
+
+::: {.callout-note collapse="true" title="🔍 Voir aussi : ROC, Précision-Rappel, calibration, matrice de confusion, outliers (en détail)"}
+Mêmes remarques qu'en B.1 (théorie déjà présentée là-bas), déjà inclus en plus compact dans `check_model_lasso()` ci-dessous :
+
+```{r khan-binom-roc-pr-calib-confusion}
+#| fig-width: 7
+#| fig-height: 6
+
+plot_roc_lasso(fit_khan_binom)
+plot_precision_recall_lasso(fit_khan_binom)
+plot_calibration_lasso(fit_khan_binom)
+plot_confusion_matrix_lasso(fit_khan_binom)
+```
+
+```{r khan-binom-outliers}
+#| fig-width: 11
+#| fig-height: 6
+
+plot(check_outliers_lasso(fit_khan_binom))
+```
+:::
+
+### Vue d'ensemble
+
+```{r khan-binom-check-model}
+#| fig-width: 13
+#| fig-height: 17
+
+check_model_lasso(fit_khan_binom, labels = labels_khan_binom)
+```
+
+### Comparer les modèles
+
+::: {.callout-tip title="📘 Comparaison appariée, cas logistique"}
+Même logique qu'en A.1/A.2 : les 2 modèles partagent exactement les mêmes folds. Les métriques de classification (Accuracy, AUC, Brier, Log-loss) sont affichées en grille carrée 2×2, comme les métriques continues pour la régression gaussienne.
+:::
+
+::: panel-tabset
+#### Comparaison 3 modèles
+
+```{r khan-binom-compare}
+#| fig-width: 14
+#| fig-height: 12
+#| cache: true
+
+# genes_khan_binom <- unique(coef_table_lasso(fit_khan_binom)$VariableOriginale)
+colonnes_candidates <- setdiff(colnames(khan_binom), c("tumor_type", "PatientID"))
+genes_khan_binom <- sample(colonnes_candidates, size = 100)
+formule_reduite_binom <- build_reduced_formula(genes_khan_binom, response = "tumor_type")
+
+comp_khan_binom <- compare_models_lasso(
+  fit = list(
+    fit_khan_binom_1,
+    fit_lasso_repeated_cv(
+        data    = khan_binom,
+        formula = formule_reduite_binom,
+        id_col  = "PatientID",
+        family  = "binomial",
+        cv_repeats = fit_khan_binom$cv_repeats
+      ),
+    fit_khan_binom
+    ),
+  labels   = c("Lasso complet", sprintf("%d variables sélectionnées", length(genes_khan_binom)), "Lasso complet (lambda optim.)")
+)
+
+comp_khan_binom$plot
+comp_khan_binom$global_test
+export_table(comp_khan_binom$variables_summary, caption = "Variables en entrée / en sortie -- diagnostic tumoral")
+```
+
+#### Comparaison 2 modèles
+
+```{r khan-binom-compare-2}
+#| fig-width: 14
+#| fig-height: 12
+#| cache: true
+
+comp_khan_binom <- compare_models_lasso(
+  fit = list(
+    fit_khan_binom_1,
+    fit_khan_binom
+    ),
+  labels   = c("Lasso complet", "Lasso complet (lambda optim.)")
+)
+
+comp_khan_binom$plot
+comp_khan_binom$global_test
+export_table(comp_khan_binom$variables_summary, caption = "Variables en entrée / en sortie -- diagnostic tumoral")
+```
+:::
+
+------------------------------------------------------------------------
+
+::: {.callout-important title="🧭 Quelle branche chaque diagnostic couvre-t-il ? Et faut-il tout dupliquer ?"}
+La plupart des `check_*()`/`plot_*()` de ce document sont construits sur la **branche CV** (`fold_predictions`, `fold_coefs`, `lambda_traj`) -- c'est un choix délibéré, pas un oubli. Une poignée vérifie spécifiquement le **modèle final** :
+
+-   `check_lambda_range_lasso()` / `plot_lambda_path_lasso()` -- `lambda.min` du modèle final est-il au bord de sa propre grille interne ?
+-   `check_collinearity_lasso(..., fit = fit, selected_only = TRUE)` -- VIF sur les variables **réellement retenues par le modèle final**.
+-   `coef_table_lasso()` -- les coefficients **officiels** du modèle final (à distinguer de `plot_coefficient_importance()`, qui résume la CV).
+-   `plot_prediction_quality(..., mode = "final"/"panel")`.
+
+**Pourquoi ne pas dupliquer systématiquement le reste** (`check_normality_lasso()`, `check_heteroscedasticity_lasso()`, `check_outliers_lasso()`, `check_independence_lasso()`, ROC/calibration...) sur le modèle final : ces diagnostics cherchent des *patterns dans le résidu* (asymétrie, individus systématiquement mal prédits, cohérence entre essais) qui n'existent, par définition, que lorsqu'on dispose de **plusieurs estimations indépendantes** du même individu -- les répétitions de la CV. Le modèle final n'offre qu'**une seule** prédiction par individu, optimiste par construction (mémorisation, cf. section précédente) -- les exécuter dessus donnerait le plus souvent un diagnostic "tout va bien" flatteur mais trompeur, sans information supplémentaire réelle.
+
+**Checklist minimale recommandée**, dans l'ordre :
+
+1.  `print(fit)` + `model_performance(fit)` -- vue d'ensemble et chiffre honnête.
+2.  `check_lambda_range_lasso()` / `plot_lambda_path_lasso()` -- le modèle final est-il bien calé.
+3.  `check_model_lasso()` -- panel complet (branche CV).
+4.  `plot_coefficient_importance()` -- quelles variables comptent, de façon stable.
+5.  `plot_prediction_quality(fit, mode = "panel")` -- les deux branches en un coup d'oeil.
+6.  `check_collinearity_lasso(..., fit = fit, selected_only = TRUE)` -- les variables retenues sont-elles trop corrélées entre elles.
+:::
+
+# Lire les visualisations d'ensemble
+
+::: {.callout-note collapse="true" title="📘 Détail des graphiques combinés (cliquer pour déplier)"}
+Plusieurs fonctions de ce toolkit assemblent, en un seul graphique, des lectures qui seraient sinon éparpillées sur plusieurs appels. Ce qui suit détaille chaque panneau, pour s'y référer sans avoir à relire toute une section.
+
+**`check_model_lasso(fit)`** -- le grand panel combiné (4 à 6 vignettes selon `family`) :
+
+-   *Régression (`family = "gaussian"`)* : qualité de prédiction (mode `"panel"`, 3 lectures) · résidus vs valeurs prédites (linéarité) · Q-Q plot des résidus (normalité, descriptive) · Scale-Location (homoscédasticité, descriptive).
+-   *Classification (`family = "binomial"`)* : qualité de prédiction (distribution des probabilités par classe) · courbe ROC · courbe de calibration · matrice de confusion.
+-   Dans les deux cas, la dernière vignette est la stabilité de la pénalisation (coefficients non nuls à travers les folds) -- l'équivalent Lasso du VIF/de l'importance des autres méthodes.
+
+**`plot_prediction_quality_lasso(fit, mode = ...)`** -- 5 lectures de la même information, à ne pas confondre :
+
+| `mode` | Ce qu'il montre | Honnête ou optimiste ? |
+|------------------------|------------------------|------------------------|
+| `"pooled"` | Tous les points de tous les folds, superposés | Honnête (CV) |
+| `"pooled_mean"` | Un point par individu = sa prédiction moyenne à travers les répétitions | Honnête (CV) |
+| `"final"` | Le modèle final réévalué sur SES PROPRES données d'entraînement | ⚠️ Optimiste (in-sample) |
+| `"overlay"` | `"pooled_mean"` et `"final"` superposés, pour visualiser l'écart | Les deux ensemble |
+| `"panel"` | `"pooled"`, `"pooled_mean"` et `"overlay"` côte à côte | Vue synthétique |
+
+Le mode `"final"` sert à *voir* l'écart avec la performance honnête (cf. callout plus haut sur les 2 processus indépendants) -- jamais à rapporter un chiffre.
+
+**Courbes ROC / calibration / matrice de confusion** (`plot_roc_lasso()`, `plot_calibration_lasso()`, `plot_confusion_matrix_lasso()`) : calculées, par défaut, sur les prédictions **poolées** de la CV (tous les folds superposés) -- l'AUC affichée est donc une AUC honnête, pas celle (optimiste) du modèle final. `mode = "overlay"` est aussi disponible sur `plot_roc_lasso()`/`plot_calibration_lasso()` pour comparer aux valeurs du modèle final.
+
+**`compare_models_lasso(fits)`** -- matrice de comparaison appariée (Wilcoxon sur les métriques poolées par fold) entre 2 à 4 Lasso partageant les mêmes folds : utile pour comparer 2 formules (cliniques seules vs cliniques + biomarqueurs) ou 2 réglages, jamais pour comparer 2 méthodes différentes (cf. `tutoriel_model_comparison_toolkit.qmd` pour cela).
+:::
+
+# Récapitulatif : quelle fonction pour quel besoin ?
+
+| Besoin | Réponse continue | Réponse binaire | Branche |
+|------------------|------------------|------------------|------------------|
+| Ajuster le modèle | `fit_lasso_repeated_cv(..., family="gaussian")` | `fit_lasso_repeated_cv(..., family="binomial")` | Les deux (construit tout) |
+| Performance globale | `model_performance()` → R², RMSE, MAE, MSE | `model_performance()` → Accuracy, AUC, Brier, Log-loss | CV |
+| Table complète des coefficients | `coef_table_lasso()` (+ `export_table()` pour CSV/Excel) | *(identique)* | Final |
+| Qualité de prédiction | `plot_prediction_quality(fit, mode = "pooled"/"pooled_mean"/"final"/"overlay"/"panel")` | `plot_prediction_quality()` (densités par classe, `mode` sans effet) | Les deux (au choix du mode) |
+| Linéarité / discrimination | `plot_residuals_vs_fitted()` | `plot_roc_lasso()`, `plot_precision_recall_lasso()` | CV |
+| Normalité / calibration | `check_normality_lasso()` | `plot_calibration_lasso()` | CV |
+| Homoscédasticité | `check_heteroscedasticity_lasso()` | *(non applicable)* | CV |
+| Matrice de confusion | — | `plot_confusion_matrix_lasso()` | CV |
+| Multicolinéarité | `check_collinearity_lasso(..., selected_only = TRUE)` pour la restreindre aux variables retenues (non calculable si p ≥ n sur l'ensemble des candidats) | *(identique)* | Final (design complet ou variables retenues) |
+| Individus à erreur systématique | `check_outliers_lasso()` | *(identique)* | CV (nécessite `repeats` ≥ 2) |
+| Cohérence entre répétitions | `check_independence_lasso()` | *(identique)* | CV (nécessite `repeats` ≥ 2) |
+| Stabilité de la pénalisation | `check_lambda_range_lasso()` / `plot_lambda_path_lasso()` | *(identique)* | Les deux |
+| Importance des variables | `plot_coefficient_importance(top_n=30)` | *(identique, échelle log-odds)* | CV |
+| Vue d'ensemble | `check_model_lasso()` | `check_model_lasso()` (détecte `family` automatiquement) | CV (panel) |
+| Comparer plusieurs modèles (grille carrée de métriques) | `compare_models_lasso()` | `compare_models_lasso(..., family="binomial")` | CV |
+
+# Références complètes
+
+**Méthode et packages**
+
+-   Tibshirani, R. (1996). *Regression Shrinkage and Selection via the Lasso.* JRSS B, 58(1), 267–288.
+-   Friedman, J., Hastie, T., & Tibshirani, R. (2010). *Regularization Paths for Generalized Linear Models via Coordinate Descent.* Journal of Statistical Software, 33(1), 1–22.
+-   Hastie, T., Tibshirani, R., & Wainwright, M. (2015). *Statistical Learning with Sparsity: The Lasso and Generalizations.* CRC Press.
+-   Bühlmann, P., & van de Geer, S. (2011). *Statistics for High-Dimensional Data.* Springer.
+-   Lüdecke, D., Ben-Shachar, M. S., Patil, I., Waggoner, P., & Makowski, D. (2021). *performance: An R Package for Assessment, Comparison and Testing of Statistical Models.* JOSS, 6(60), 3139.
+-   Meinshausen, N., & Bühlmann, P. (2010). *Stability Selection.* JRSS B, 72(4), 417–473.
+-   Haury, A.-C., Mordelet, F., Vera-Licona, P., & Vert, J.-P. (2012). *TIGRESS: Trustful Inference of Gene REgulation using Stability Selection.* BMC Systems Biology, 6, 145.
+
+**Validation croisée**
+
+-   Kohavi, R. (1995). *A study of cross-validation and bootstrap for accuracy estimation and model selection.* Proceedings of IJCAI.
+-   Varma, S., & Simon, R. (2006). *Bias in error estimation when using cross-validation for model selection.* BMC Bioinformatics, 7, 91.
+
+**Diagnostics de régression continue**
+
+-   Marquardt, D. W. (1970). *Generalized Inverses, Ridge Regression, Biased Linear Estimation, and Nonlinear Estimation.* Technometrics, 12(3), 591–612.
+-   Shapiro, S. S., & Wilk, M. B. (1965). *An analysis of variance test for normality (complete samples).* Biometrika, 52(3/4), 591–611.
+-   Anderson, T. W., & Darling, D. A. (1952). *Asymptotic theory of certain "goodness of fit" criteria based on stochastic processes.* Annals of Mathematical Statistics, 23(2), 193–212.
+-   Breusch, T. S., & Pagan, A. R. (1979). *A simple test for heteroscedasticity and random coefficient variation.* Econometrica, 47(5), 1287–1294.
+
+**Diagnostics de classification**
+
+-   Hosmer, D. W., Lemeshow, S., & Sturdivant, R. X. (2013). *Applied Logistic Regression* (3ᵉ éd.). Wiley.
+-   Altman, D. G., & Bland, J. M. (1994). *Diagnostic tests 1: sensitivity and specificity.* BMJ, 308(6943), 1552.
+-   Hanley, J. A., & McNeil, B. J. (1982). *The meaning and use of the area under a receiver operating characteristic (ROC) curve.* Radiology, 143(1), 29–36.
+-   Brier, G. W. (1950). *Verification of forecasts expressed in terms of probability.* Monthly Weather Review, 78(1), 1–3.
+-   Saito, T., & Rehmsmeier, M. (2015). *The Precision-Recall Plot Is More Informative than the ROC Plot When Evaluating Binary Classifiers on Imbalanced Datasets.* PLOS ONE, 10(3), e0118432.
+-   Van Calster, B., Nieboer, D., Vergouwe, Y., De Cock, B., Pencina, M. J., & Steyerberg, E. W. (2016). *A calibration hierarchy for risk models was defined: from utopia to empirical data.* Journal of Clinical Epidemiology, 74, 167–176.
+
+**Tests de comparaison**
+
+-   Wilcoxon, F. (1945). *Individual comparisons by ranking methods.* Biometrics Bulletin, 1(6), 80–83.
+-   Friedman, M. (1937). *The use of ranks to avoid the assumption of normality implicit in the analysis of variance.* JASA, 32(200), 675–701.
+
+**Jeux de données**
+
+-   Efron, B., Hastie, T., Johnstone, I., & Tibshirani, R. (2004). *Least Angle Regression.* The Annals of Statistics, 32(2), 407–499. (Données `diabetes`, distribuées via le package `{lars}` sur CRAN, entre autres.)
+-   Craig-Schapiro, R., Kuhn, M., Xiong, C., Pickering, E. H., Liu, J., Misko, T. P., Perrin, R. J., et al. (2011). *Multiplexed immunoassay panel identifies novel CSF biomarkers for Alzheimer's disease diagnosis and prognosis.* PLOS ONE, 6(4), e18850. (Données `AlzheimerDisease`, distribuées via le package `{AppliedPredictiveModeling}` sur CRAN.)
+-   Kuhn, M., & Johnson, K. (2013). *Applied Predictive Modeling.* Springer.
+-   Khan, J., Wei, J. S., Ringnér, M., Saal, L. H., Ladanyi, M., Westermann, F., Berthold, F., Schwab, M., Antonescu, C. R., Peterson, C., & Meltzer, P. S. (2001). *Classification and diagnostic prediction of cancers using gene expression profiling and artificial neural networks.* Nature Medicine, 7(6), 673–679. (Données distribuées via le package `{ISLR2}` sur CRAN.)

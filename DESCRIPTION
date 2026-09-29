@@ -1,0 +1,44 @@
+Package: cvperf
+Type: Package
+Title: Performance de Modeles Predictifs en Validation Croisee Repetee
+Version: 0.1.0
+Authors@R: person("Clément", "Poupelin", role = c("aut", "cre"),
+    email = "clement.poupelin@example.com")
+Description: Ajustement et diagnostic de modeles predictifs (Lasso/Elastic Net,
+    foret aleatoire, XGBoost, SVM, MARS) en validation croisee repetee, avec une
+    interface commune inspiree du package 'performance' : metriques poolees et par
+    fold, diagnostics de residus, courbes ROC/calibration, importance des
+    variables et stabilite, dependance partielle, valeurs de Shapley
+    (meme algorithme pour toutes les methodes) et comparaison appariee de
+    methodes ajustees sur les memes folds.
+License: MIT + file LICENSE
+Encoding: UTF-8
+Language: fr
+Depends: R (>= 4.1)
+Imports:
+    dplyr (>= 1.1.0),
+    ggplot2 (>= 3.5.0),
+    ggrepel,
+    knitr,
+    nortest,
+    parallel,
+    patchwork,
+    purrr (>= 1.0.0),
+    rlang,
+    rsample,
+    stats,
+    tibble,
+    tidyr,
+    utils
+Suggests:
+    car,
+    DT,
+    e1071,
+    earth,
+    fastshap,
+    glmnet,
+    ranger,
+    testthat (>= 3.0.0),
+    xgboost
+Config/testthat/edition: 3
+RoxygenNote: 7.3.2
