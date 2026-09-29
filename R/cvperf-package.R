@@ -18,6 +18,7 @@
 #' @keywords internal
 #' @importFrom dplyr %>%
 #' @importFrom rlang .data :=
+#' @importFrom patchwork plot_annotation plot_layout wrap_plots
 "_PACKAGE"
 
 utils::globalVariables(c(
@@ -40,5 +41,5 @@ utils::globalVariables(c(
   "Lasso_pct_folds_selectionnee", "Lasso_selectionnee", "n_methodes",
   "sst", "sse", "rmse", "mae", "rsq", "mse", "p_value", "p_adj",
   "accuracy", "sensitivity", "specificity", "precision", "f1", "auc", "brier",
-  "logloss", "rank", "nprune"
+  "logloss", "rank", "nprune", "density", "mean_shap", "eta_lab", "Tolerance"
 ))

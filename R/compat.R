@@ -10,29 +10,9 @@
 #'
 #' Alias vers les fonctions communes, pour que les scripts ecrits avec les
 #' toolkits \code{*_performance_toolkit.R} fonctionnent sans modification.
-#' @param fit,x,fits,model objets d'entree
+#' @param fit,x,fits objets d'entree
 #' @param ... arguments transmis
 #' @name cvperf-compat
-#' @rawNamespace export(plot.check_normality_lasso)
-#' @rawNamespace export(plot.check_heteroscedasticity_lasso)
-#' @rawNamespace export(plot.check_outliers_lasso)
-#' @rawNamespace export(plot.check_independence_lasso)
-#' @rawNamespace export(plot.check_normality_rf)
-#' @rawNamespace export(plot.check_heteroscedasticity_rf)
-#' @rawNamespace export(plot.check_outliers_rf)
-#' @rawNamespace export(plot.check_independence_rf)
-#' @rawNamespace export(plot.check_normality_xgb)
-#' @rawNamespace export(plot.check_heteroscedasticity_xgb)
-#' @rawNamespace export(plot.check_outliers_xgb)
-#' @rawNamespace export(plot.check_independence_xgb)
-#' @rawNamespace export(plot.check_normality_svm)
-#' @rawNamespace export(plot.check_heteroscedasticity_svm)
-#' @rawNamespace export(plot.check_outliers_svm)
-#' @rawNamespace export(plot.check_independence_svm)
-#' @rawNamespace export(plot.check_normality_mars)
-#' @rawNamespace export(plot.check_heteroscedasticity_mars)
-#' @rawNamespace export(plot.check_outliers_mars)
-#' @rawNamespace export(plot.check_independence_mars)
 NULL
 
 # ---- lasso ----
@@ -102,18 +82,26 @@ check_model_lasso <- function(fit, ...) {
   check_model(fit, ...)
 }
 
+#' @rdname cvperf-compat
+#' @export plot.check_normality_lasso
 plot.check_normality_lasso <- function(x, ...) {
   plot(x, ...)
 }
 
+#' @rdname cvperf-compat
+#' @export plot.check_heteroscedasticity_lasso
 plot.check_heteroscedasticity_lasso <- function(x, ...) {
   plot(x, ...)
 }
 
+#' @rdname cvperf-compat
+#' @export plot.check_outliers_lasso
 plot.check_outliers_lasso <- function(x, ...) {
   plot(x, ...)
 }
 
+#' @rdname cvperf-compat
+#' @export plot.check_independence_lasso
 plot.check_independence_lasso <- function(x, ...) {
   plot(x, ...)
 }
@@ -212,18 +200,26 @@ plot_residuals_distribution_rf <- function(fit, ...) {
   plot_residuals_distribution(fit, ...)
 }
 
+#' @rdname cvperf-compat
+#' @export plot.check_normality_rf
 plot.check_normality_rf <- function(x, ...) {
   plot(x, ...)
 }
 
+#' @rdname cvperf-compat
+#' @export plot.check_heteroscedasticity_rf
 plot.check_heteroscedasticity_rf <- function(x, ...) {
   plot(x, ...)
 }
 
+#' @rdname cvperf-compat
+#' @export plot.check_outliers_rf
 plot.check_outliers_rf <- function(x, ...) {
   plot(x, ...)
 }
 
+#' @rdname cvperf-compat
+#' @export plot.check_independence_rf
 plot.check_independence_rf <- function(x, ...) {
   plot(x, ...)
 }
@@ -377,18 +373,26 @@ plot_residuals_distribution_xgb <- function(fit, ...) {
   plot_residuals_distribution(fit, ...)
 }
 
+#' @rdname cvperf-compat
+#' @export plot.check_normality_xgb
 plot.check_normality_xgb <- function(x, ...) {
   plot(x, ...)
 }
 
+#' @rdname cvperf-compat
+#' @export plot.check_heteroscedasticity_xgb
 plot.check_heteroscedasticity_xgb <- function(x, ...) {
   plot(x, ...)
 }
 
+#' @rdname cvperf-compat
+#' @export plot.check_outliers_xgb
 plot.check_outliers_xgb <- function(x, ...) {
   plot(x, ...)
 }
 
+#' @rdname cvperf-compat
+#' @export plot.check_independence_xgb
 plot.check_independence_xgb <- function(x, ...) {
   plot(x, ...)
 }
@@ -543,18 +547,26 @@ plot_residuals_distribution_svm <- function(fit, ...) {
   plot_residuals_distribution(fit, ...)
 }
 
+#' @rdname cvperf-compat
+#' @export plot.check_normality_svm
 plot.check_normality_svm <- function(x, ...) {
   plot(x, ...)
 }
 
+#' @rdname cvperf-compat
+#' @export plot.check_heteroscedasticity_svm
 plot.check_heteroscedasticity_svm <- function(x, ...) {
   plot(x, ...)
 }
 
+#' @rdname cvperf-compat
+#' @export plot.check_outliers_svm
 plot.check_outliers_svm <- function(x, ...) {
   plot(x, ...)
 }
 
+#' @rdname cvperf-compat
+#' @export plot.check_independence_svm
 plot.check_independence_svm <- function(x, ...) {
   plot(x, ...)
 }
@@ -709,18 +721,26 @@ plot_residuals_distribution_mars <- function(fit, ...) {
   plot_residuals_distribution(fit, ...)
 }
 
+#' @rdname cvperf-compat
+#' @export plot.check_normality_mars
 plot.check_normality_mars <- function(x, ...) {
   plot(x, ...)
 }
 
+#' @rdname cvperf-compat
+#' @export plot.check_heteroscedasticity_mars
 plot.check_heteroscedasticity_mars <- function(x, ...) {
   plot(x, ...)
 }
 
+#' @rdname cvperf-compat
+#' @export plot.check_outliers_mars
 plot.check_outliers_mars <- function(x, ...) {
   plot(x, ...)
 }
 
+#' @rdname cvperf-compat
+#' @export plot.check_independence_mars
 plot.check_independence_mars <- function(x, ...) {
   plot(x, ...)
 }

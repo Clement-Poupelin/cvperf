@@ -7,8 +7,10 @@ Le package regroupe les toolkits `*_performance_toolkit.R`, `shap_toolkit.R` et 
 ## Installation
 
 ```r
-# depuis le dossier parent de cvperf/
-devtools::install("cvperf")
+# depuis la racine du package (le dossier qui contient DESCRIPTION)
+devtools::document()
+devtools::install()
+# ou depuis le dossier parent : devtools::install("cvperf")
 # méthodes utilisées (installer celles dont on a besoin)
 install.packages(c("glmnet", "ranger", "xgboost", "e1071", "earth", "fastshap", "car", "DT"))
 ```
